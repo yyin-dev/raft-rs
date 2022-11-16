@@ -119,6 +119,16 @@ pub struct Raft {
     apply_ch: UnboundedSender<ApplyMsg>,
 }
 
+#[derive(Message)]
+struct PersistentState {
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
+    #[prost(uint64, optional, tag = "2")]
+    pub voted_for: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub log: Vec<Entry>,
+}
+
 impl Raft {
     /// the service or tester wants to create a Raft server. the ports
     /// of all the Raft servers (including this one) are in peers. this
@@ -174,13 +184,25 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+
+        let s = PersistentState {
+            term: self.curr_term,
+            voted_for: self.voted_for.map(|p| p as u64),
+            log: self.log.clone(),
+        };
+
+        let mut buf: Vec<u8> = vec![];
+        labcodec::encode(&s, &mut buf).unwrap();
+        self.persister.save_raft_state(buf);
     }
 
     /// restore previously persisted state.
     fn restore(&mut self, data: &[u8]) {
         if data.is_empty() {
             // bootstrap without any state?
+            return;
         }
+
         // Your code here (2C).
         // Example:
         // match labcodec::decode(data) {
@@ -192,6 +214,16 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        match labcodec::decode::<PersistentState>(data) {
+            Ok(s) => {
+                self.curr_term = s.term;
+                self.voted_for = s.voted_for.map(|p| p as usize);
+                self.log = s.log;
+            }
+            Err(e) => {
+                panic!("decode error: {:?}", e);
+            }
+        }
     }
 
     fn as_follower(&mut self, new_term: u64) {
@@ -261,6 +293,7 @@ impl Raft {
     fn run_election(&mut self) {
         // becomes candidate: increment current term, vote for self
         self.as_candidate();
+        self.persist();
 
         // send RequestVote to others in parallel
         for p in self.other_peers() {
@@ -334,6 +367,7 @@ impl Raft {
     fn handle_term(&mut self, term: u64) -> bool {
         if term > self.curr_term {
             self.as_follower(term);
+            self.persist();
             true
         } else {
             false
@@ -361,6 +395,7 @@ impl Raft {
 
         if vote_granted {
             self.voted_for = Some(args.candidate_id as usize);
+            self.persist();
         }
 
         info!(
@@ -444,6 +479,7 @@ impl Raft {
             self.apply_committed();
         }
 
+        self.persist();
         AppendEntriesReply {
             term: self.curr_term,
             success: true,
@@ -475,7 +511,7 @@ impl Raft {
                 }
 
                 // term confusion!
-                if reply.term != args.term {
+                if reply.term != args.term || args.term != self.curr_term {
                     return;
                 }
 
@@ -483,14 +519,16 @@ impl Raft {
                     self.votes_received += 1;
                     if self.votes_received >= self.majority() {
                         self.as_leader();
+                        self.persist();
+
                         self.send_heartbeats();
                     }
                 }
             }
             Event::AppendEntriesReplyMsg((from, reply, args)) => {
                 info!(
-                    "[{}] term={} get AppendEntries reply from [{}], term={}, success={}",
-                    self.me, self.curr_term, from, reply.term, reply.success
+                    "[{}] term={} get AppendEntries reply from [{}], term={}, success={}, args={:?}",
+                    self.me, self.curr_term, from, reply.term, reply.success, args
                 );
 
                 let term_passed = self.handle_term(reply.term);
@@ -503,7 +541,7 @@ impl Raft {
                 }
 
                 // term confusion!
-                if reply.term != args.term {
+                if reply.term != args.term || args.term != self.curr_term {
                     return;
                 }
 
@@ -515,10 +553,16 @@ impl Raft {
                     // There are two reasons for failing: term passed, log inconsitency.
                     // We would have already returned if term passed, so must be due to log inconsistency.
                     info!(
-                        "[{}] AppendEntries to [{}] failed because of log inconsistency.",
-                        self.me, from
+                        "[{}] AppendEntries to [{}] failed because of log inconsistency. next_idx={} will be decremented",
+                        self.me, from, self.next_idx[from],
                     );
-                    self.next_idx[from] -= 1;
+
+                    // Simply decrement self.next_idx[from] is wrong.
+                    // Reason: in unreliable network, message can be repeated. So you can get repeated
+                    // "log inconsistency" replies for one AppendEntries RPC. Do NOT decrement
+                    // next_idx more than you should!
+                    self.next_idx[from] = std::cmp::min(self.next_idx[from], args.prev_log_idx);
+
                     self.send_append_entries(from, self.append_entries_arg(from));
                 }
 
@@ -533,6 +577,7 @@ impl Raft {
                         self.commit_idx = n;
                     }
                 }
+                self.persist();
                 self.apply_committed();
             }
         }
@@ -582,8 +627,6 @@ impl Raft {
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
-        self.persist();
-        let _ = &self.persister;
     }
 }
 
