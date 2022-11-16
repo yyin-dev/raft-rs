@@ -52,11 +52,6 @@ impl State {
     }
 }
 
-struct LogEntry {
-    term: u64,
-    // cmd: Vec<u8>,
-}
-
 #[derive(PartialEq, Eq)]
 enum Role {
     Follower,
@@ -65,9 +60,11 @@ enum Role {
 }
 
 enum Event {
+    ResetElectionTimeout,
     ElectionTimeout,
     HeartbeatTimeout,
-    RequestVoteReply(RequestVoteReply),
+    RequestVoteReplyMsg((usize, RequestVoteReply)),
+    AppendEntriesReplyMsg((usize, AppendEntriesReply)),
 }
 
 // A single Raft peer.
@@ -85,7 +82,7 @@ pub struct Raft {
     // voted for in current term
     voted_for: Option<usize>,
     // log entries
-    log: Vec<LogEntry>,
+    log: Vec<Entry>,
 
     // States for event handling
     votes_received: u64,
@@ -168,13 +165,14 @@ impl Raft {
         info!("[{}] -> follower, term={}", self.me, new_term);
         self.curr_term = new_term;
         self.role = Role::Follower;
+        self.voted_for = None;
     }
 
     fn as_candidate(&mut self) {
         self.curr_term += 1;
         self.role = Role::Candidate;
         self.voted_for = Some(self.me);
-        self.votes_received = 0;
+        self.votes_received = 1;
         info!("[{}] -> candidate, term={}", self.me, self.curr_term);
     }
 
@@ -199,6 +197,16 @@ impl Raft {
         }
     }
 
+    fn append_entries_arg(&self) -> AppendEntriesArgs {
+        AppendEntriesArgs {
+            term: self.curr_term,
+            leader_id: self.me as u64,
+            prev_log_idx: 0,
+            prev_log_term: 0,
+            entries: vec![],
+        }
+    }
+
     fn other_peers(&self) -> impl Iterator<Item = usize> + '_ {
         let range = 0..self.peers.len();
         range.into_iter().filter(move |p| *p != self.me)
@@ -216,6 +224,12 @@ impl Raft {
         for p in self.other_peers() {
             info!("[{}] send RequestVote to [{}]", self.me, p);
             self.send_request_vote(p, self.request_vote_arg());
+        }
+    }
+
+    fn send_heartbeats(&mut self) {
+        for p in self.other_peers() {
+            self.send_append_entries(p, self.append_entries_arg());
         }
     }
 
@@ -258,7 +272,22 @@ impl Raft {
             let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
             if let Ok(reply) = res {
                 event_tx
-                    .unbounded_send(Event::RequestVoteReply(reply))
+                    .unbounded_send(Event::RequestVoteReplyMsg((server, reply)))
+                    .unwrap();
+            }
+        });
+    }
+
+    fn send_append_entries(&self, server: usize, args: AppendEntriesArgs) {
+        let peer = &self.peers[server];
+        let peer_clone = peer.clone();
+
+        let event_tx = self.event_tx.as_ref().unwrap().clone();
+        peer.spawn(async move {
+            let res = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
+            if let Ok(reply) = res {
+                event_tx
+                    .unbounded_send(Event::AppendEntriesReplyMsg((server, reply)))
                     .unwrap();
             }
         });
@@ -271,11 +300,6 @@ impl Raft {
     }
 
     fn handle_request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
-        info!(
-            "[{}] RequestVote from [{}], term=[{}]",
-            self.me, args.candidate_id, args.term
-        );
-
         self.handle_term(args.term);
 
         let vote_granted = if args.term < self.curr_term {
@@ -293,36 +317,83 @@ impl Raft {
             self.voted_for = Some(args.candidate_id as usize);
         }
 
+        info!(
+            "[{}] RequestVote from [{}], term={}, granted={}",
+            self.me, args.candidate_id, args.term, vote_granted
+        );
+
         RequestVoteReply {
             term: self.curr_term,
             vote_granted,
         }
     }
 
+    fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+        self.handle_term(args.term);
+
+        if args.term < self.curr_term {
+            AppendEntriesReply {
+                term: self.curr_term,
+                success: false,
+            }
+        } else {
+            self.event_tx
+                .as_ref()
+                .unwrap()
+                .unbounded_send(Event::ResetElectionTimeout)
+                .unwrap();
+            AppendEntriesReply {
+                term: self.curr_term,
+                success: true,
+            }
+        }
+    }
+
     fn handle_event(&mut self, event: Event) {
         match event {
+            Event::ResetElectionTimeout => unreachable!(),
             Event::ElectionTimeout => {
                 if self.role != Role::Leader {
                     self.run_election();
                 }
             }
-            Event::HeartbeatTimeout => {}
-            Event::RequestVoteReply(reply) => {
+            Event::HeartbeatTimeout => {
+                if self.role == Role::Leader {
+                    self.send_heartbeats();
+                }
+            }
+            Event::RequestVoteReplyMsg((from, reply)) => {
                 info!(
-                    "[{}] get RequestVote reply, term={}, granted={}",
-                    self.me, reply.term, reply.vote_granted
+                    "[{}] get RequestVote reply from [{}], term={}, granted={}",
+                    self.me, from, reply.term, reply.vote_granted
                 );
+
+                self.handle_term(reply.term);
+                if self.role != Role::Candidate {
+                    return;
+                }
+
                 if reply.term > self.curr_term {
                     self.as_follower(reply.term);
                 } else if reply.term == self.curr_term {
-                    self.votes_received += 1;
-                    if self.votes_received >= self.majority() {
-                        self.as_leader();
-                        // TODO: Send AppendEntries heartbeat immediately
+                    if reply.vote_granted {
+                        self.votes_received += 1;
+                        if self.votes_received >= self.majority() {
+                            self.as_leader();
+                            self.send_heartbeats();
+                        }
                     }
                 } else {
                     unreachable!()
                 }
+            }
+            Event::AppendEntriesReplyMsg((from, reply)) => {
+                info!(
+                    "[{}] get AppendEntries reply from [{}], term={}, success={}",
+                    self.me, from, reply.term, reply.success
+                );
+
+                self.handle_term(reply.term);
             }
         }
     }
@@ -438,7 +509,11 @@ impl Node {
                 loop {
                     select! {
                         e = event_rx.select_next_some() => {
-                            raft.lock().unwrap().handle_event(e);
+                            if let Event::ResetElectionTimeout = e {
+                                elec_timeout = reset_elec_timeout();
+                            } else {
+                                raft.lock().unwrap().handle_event(e);
+                            }
                         },
                         _ = elec_timeout => {
                             event_tx.unbounded_send(Event::ElectionTimeout).unwrap();
@@ -548,5 +623,9 @@ impl RaftService for Node {
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
         Ok(self.raft.lock().unwrap().handle_request_vote(args))
+    }
+
+    async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
+        Ok(self.raft.lock().unwrap().handle_append_entries(args))
     }
 }
