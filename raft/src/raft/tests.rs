@@ -154,6 +154,7 @@ fn test_fail_agree_2b() {
     // follower network disconnection
     let leader = cfg.check_one_leader();
     cfg.disconnect((leader + 1) % servers);
+    info!("[Test] [{}] disconnected", (leader + 1) % servers);
 
     // agree despite one disconnected server?
     cfg.one(Entry { x: 102 }, servers - 1, false);
@@ -164,6 +165,7 @@ fn test_fail_agree_2b() {
 
     // re-connect
     cfg.connect((leader + 1) % servers);
+    info!("[Test] [{}] reconnected", (leader + 1) % servers);
 
     // agree with full set of servers?
     cfg.one(Entry { x: 106 }, servers, true);
@@ -370,6 +372,119 @@ fn test_rejoin_2b() {
     cfg.end();
 }
 
+#[allow(dead_code)]
+/// The same as test_backup_2b, but use monotonically increasing entries
+fn test_backup_debug_2b() {
+    let servers = 5;
+    let mut cfg = Config::new(servers);
+
+    cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs");
+
+    let mut entry_idx = 0;
+    let mut next_entry = || {
+        let e = Entry { x: entry_idx };
+        entry_idx += 1;
+        e
+    };
+
+    // let mut random = rand::thread_rng();
+    cfg.one(next_entry(), servers, true);
+
+    // put leader and one follower in a partition
+    let leader1 = cfg.check_one_leader();
+    info!(
+        "[Test] Leader [{}] and [{}] in the same partition",
+        leader1,
+        (leader1 + 1) % servers
+    );
+
+    cfg.disconnect((leader1 + 2) % servers);
+    cfg.disconnect((leader1 + 3) % servers);
+    cfg.disconnect((leader1 + 4) % servers);
+    info!("[Test] the other 3 disconnected");
+
+    // submit lots of commands that won't commit
+    for _i in 0..50 {
+        let _ = cfg.rafts.lock().unwrap()[leader1]
+            .as_ref()
+            .unwrap()
+            .start(&next_entry());
+    }
+
+    thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
+
+    cfg.disconnect((leader1 + 0) % servers);
+    cfg.disconnect((leader1 + 1) % servers);
+    info!(
+        "[Test] old leader [{}] and [{}] disconnected",
+        leader1,
+        (leader1 + 1) % servers
+    );
+
+    // allow other partition to recover
+    cfg.connect((leader1 + 2) % servers);
+    cfg.connect((leader1 + 3) % servers);
+    cfg.connect((leader1 + 4) % servers);
+    info!("[Test] Reconnect the other 3");
+
+    // lots of successful commands to new group.
+    for _i in 0..50 {
+        cfg.one(next_entry(), 3, true);
+    }
+
+    info!("[Test] the other 3 committed 50 entries");
+
+    // now another partitioned leader and one follower
+    let leader2 = cfg.check_one_leader();
+    let mut other = (leader1 + 2) % servers;
+    if leader2 == other {
+        other = (leader2 + 1) % servers;
+    }
+    cfg.disconnect(other);
+    info!(
+        "[Test] disconnected [{}], current leader: [{}]",
+        other, leader2
+    );
+
+    // lots more commands that won't commit
+    for _i in 0..50 {
+        let _ = cfg.rafts.lock().unwrap()[leader2]
+            .as_ref()
+            .unwrap()
+            .start(&next_entry());
+    }
+    info!("[Test] 50 entries that won't commit");
+
+    thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
+
+    // bring original leader back to life,
+    for i in 0..servers {
+        cfg.disconnect(i);
+    }
+    cfg.connect((leader1 + 0) % servers);
+    cfg.connect((leader1 + 1) % servers);
+    cfg.connect(other);
+    info!(
+        "[Test] [{}], [{}], [{}] in the same partition",
+        (leader1 + 0) % servers,
+        (leader1 + 1) % servers,
+        other
+    );
+
+    // lots of successful commands to new group.
+    for _i in 0..50 {
+        cfg.one(next_entry(), 3, true);
+    }
+
+    // now everyone
+    for i in 0..servers {
+        cfg.connect(i);
+    }
+    cfg.one(next_entry(), servers, true);
+
+    cfg.end();
+}
+
 #[test]
 fn test_backup_2b() {
     let servers = 5;
@@ -403,6 +518,7 @@ fn test_backup_2b() {
     cfg.connect((leader1 + 2) % servers);
     cfg.connect((leader1 + 3) % servers);
     cfg.connect((leader1 + 4) % servers);
+    info!("[Test] Reconnect the other 3");
 
     // lots of successful commands to new group.
     for _i in 0..50 {

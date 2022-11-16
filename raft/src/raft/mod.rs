@@ -7,10 +7,28 @@ use rand::Rng;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(test)]
+// To print commands in a readable way for debugging
 pub mod config;
 pub mod errors;
 pub mod persister;
+
+impl std::fmt::Display for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let m: config::Entry = labcodec::decode(&self.cmd).unwrap();
+        write!(f, "[term={}, cmd={}]", self.term, m.x)
+    }
+}
+
+fn entries_to_str(entries: &Vec<Entry>) -> String {
+    let v: Vec<_> = entries.iter().map(|e| e.to_string()).collect();
+    format!("len={}, {}", entries.len(), v.join(", "))
+}
+
+// #[cfg(test)]
+// pub mod config;
+// pub mod errors;
+// pub mod persister;
+
 #[cfg(test)]
 mod tests;
 
@@ -63,8 +81,8 @@ enum Event {
     ResetElectionTimeout,
     ElectionTimeout,
     HeartbeatTimeout,
-    RequestVoteReplyMsg((usize, RequestVoteReply)),
-    AppendEntriesReplyMsg((usize, AppendEntriesReply)),
+    RequestVoteReplyMsg((usize, RequestVoteReply, RequestVoteArgs)),
+    AppendEntriesReplyMsg((usize, AppendEntriesReply, AppendEntriesArgs)),
 }
 
 // A single Raft peer.
@@ -83,6 +101,14 @@ pub struct Raft {
     voted_for: Option<usize>,
     // log entries
     log: Vec<Entry>,
+    // commit index
+    commit_idx: u64,
+    // last applied entry index
+    last_applied: u64,
+    // index of next log entry to send for log replication (this is a guess)
+    next_idx: Vec<u64>,
+    // index of the highest log entry known to be replicated (this is a truth)
+    match_idx: Vec<u64>,
 
     // States for event handling
     votes_received: u64,
@@ -110,7 +136,7 @@ impl Raft {
     ) -> Raft {
         let raft_state = persister.raft_state();
 
-        // Your initialization code here (2A, 2B, 2C).
+        let n = peers.len();
         let mut rf = Raft {
             peers,
             persister,
@@ -118,7 +144,15 @@ impl Raft {
             role: Role::Follower,
             curr_term: 0,
             voted_for: None,
-            log: vec![],
+            // Initialize with a dummy entry, that has been committed & applied.
+            log: vec![Entry {
+                term: 0,
+                cmd: vec![],
+            }],
+            commit_idx: 0,
+            last_applied: 0,
+            next_idx: vec![1; n],
+            match_idx: vec![0; n],
             votes_received: 0,
             event_tx: None,
             apply_ch,
@@ -128,7 +162,6 @@ impl Raft {
         rf.restore(&raft_state);
         rf.as_follower(rf.curr_term);
 
-        info!("[{}] started", rf.me);
         rf
     }
 
@@ -177,17 +210,24 @@ impl Raft {
     }
 
     fn as_leader(&mut self) {
-        info!("[{}] -> leader, term={}", self.me, self.curr_term);
+        info!(
+            "[{}] -> leader, term={}, log: {}",
+            self.me,
+            self.curr_term,
+            entries_to_str(&self.log)
+        );
         self.role = Role::Leader;
+        for i in 0..self.next_idx.len() {
+            self.next_idx[i] = self.log.len() as u64;
+        }
+        for i in 0..self.match_idx.len() {
+            self.match_idx[i] = 0;
+        }
     }
 
     fn request_vote_arg(&self) -> RequestVoteArgs {
-        let last_log_idx = self.log.len() as i64 - 1;
-        let last_log_term = if last_log_idx >= 0 {
-            self.log.get(last_log_idx as usize).unwrap().term
-        } else {
-            0
-        };
+        let last_log_idx = self.log.len() as u64 - 1;
+        let last_log_term = self.log.get(last_log_idx as usize).unwrap().term;
 
         RequestVoteArgs {
             term: self.curr_term,
@@ -197,13 +237,15 @@ impl Raft {
         }
     }
 
-    fn append_entries_arg(&self) -> AppendEntriesArgs {
+    fn append_entries_arg(&self, peer: usize) -> AppendEntriesArgs {
+        let prev_log_idx = self.next_idx[peer] - 1;
         AppendEntriesArgs {
             term: self.curr_term,
             leader_id: self.me as u64,
-            prev_log_idx: 0,
-            prev_log_term: 0,
-            entries: vec![],
+            prev_log_idx,
+            prev_log_term: self.log[prev_log_idx as usize].term,
+            entries: self.log[self.next_idx[peer] as usize..].to_vec(),
+            leader_commit: self.commit_idx,
         }
     }
 
@@ -229,14 +271,10 @@ impl Raft {
 
     fn send_heartbeats(&mut self) {
         for p in self.other_peers() {
-            self.send_append_entries(p, self.append_entries_arg());
+            self.send_append_entries(p, self.append_entries_arg(p));
         }
     }
 
-    /// example code to send a RequestVote RPC to a server.
-    /// server is the index of the target server in peers.
-    /// expects RPC arguments in args.
-    ///
     /// The labrpc package simulates a lossy network, in which servers
     /// may be unreachable, and in which requests and replies may be lost.
     /// This method sends a request and waits for a reply. If a reply arrives
@@ -251,19 +289,6 @@ impl Raft {
     ///
     /// look at the comments in ../labrpc/src/lib.rs for more details.
     fn send_request_vote(&self, server: usize, args: RequestVoteArgs) {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let peer_clone = peer.clone();
-        // let (tx, rx) = channel();
-        // peer.spawn(async move {
-        //     let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-        //     tx.send(res);
-        // });
-        // rx
-        // ```
-
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
 
@@ -272,7 +297,7 @@ impl Raft {
             let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
             if let Ok(reply) = res {
                 event_tx
-                    .unbounded_send(Event::RequestVoteReplyMsg((server, reply)))
+                    .unbounded_send(Event::RequestVoteReplyMsg((server, reply, args)))
                     .unwrap();
             }
         });
@@ -287,39 +312,65 @@ impl Raft {
             let res = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
             if let Ok(reply) = res {
                 event_tx
-                    .unbounded_send(Event::AppendEntriesReplyMsg((server, reply)))
+                    .unbounded_send(Event::AppendEntriesReplyMsg((server, reply, args)))
                     .unwrap();
             }
         });
     }
 
-    fn handle_term(&mut self, term: u64) {
+    fn apply_committed(&mut self) {
+        for i in self.last_applied + 1..self.commit_idx + 1 {
+            self.apply_ch
+                .unbounded_send(ApplyMsg::Command {
+                    data: self.log[i as usize].cmd.clone(),
+                    index: i,
+                })
+                .unwrap();
+        }
+        self.last_applied = self.commit_idx;
+    }
+
+    // Step down to follower if term > self.term
+    fn handle_term(&mut self, term: u64) -> bool {
         if term > self.curr_term {
             self.as_follower(term);
+            true
+        } else {
+            false
         }
     }
 
     fn handle_request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
         self.handle_term(args.term);
 
-        let vote_granted = if args.term < self.curr_term {
-            false
-        } else {
-            let never_voted = self.voted_for.is_none();
-            let same_vote = self
-                .voted_for
-                .map_or(false, |v| v as u64 == args.candidate_id);
+        if args.term < self.curr_term {
+            return RequestVoteReply {
+                term: self.curr_term,
+                vote_granted: false,
+            };
+        }
 
-            never_voted || same_vote
-        };
+        let can_vote =
+            self.voted_for.is_none() || self.voted_for.unwrap() as u64 == args.candidate_id;
+
+        let log_up_to_date = args.last_log_term > self.log.last().unwrap().term
+            || args.last_log_term == self.log.last().unwrap().term
+                && args.last_log_idx >= self.log.len() as u64 - 1;
+
+        let vote_granted = can_vote && log_up_to_date;
 
         if vote_granted {
             self.voted_for = Some(args.candidate_id as usize);
         }
 
         info!(
-            "[{}] RequestVote from [{}], term={}, granted={}",
-            self.me, args.candidate_id, args.term, vote_granted
+            "[{}] RequestVote from [{}], term={}, last_log_term={}, last_log_idx={}, granted={}",
+            self.me,
+            args.candidate_id,
+            args.term,
+            args.last_log_term,
+            args.last_log_idx,
+            vote_granted
         );
 
         RequestVoteReply {
@@ -329,23 +380,73 @@ impl Raft {
     }
 
     fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+        info!("[{}] curr_term: {}, received AppendEntries from [{}], term={}, prev_log_idx: {}, prev_log_term: {}, entries: {}, curr_log: {}", 
+            self.me, self.curr_term, args.leader_id, args.term, args.prev_log_idx, args.prev_log_term, entries_to_str(&args.entries), entries_to_str(&self.log));
+
         self.handle_term(args.term);
 
+        let false_reply = AppendEntriesReply {
+            term: self.curr_term,
+            success: false,
+        };
+
         if args.term < self.curr_term {
-            AppendEntriesReply {
-                term: self.curr_term,
-                success: false,
+            return false_reply;
+        }
+
+        // Valid AppendEntries from current leader, reset election timeout
+        self.event_tx
+            .as_ref()
+            .unwrap()
+            .unbounded_send(Event::ResetElectionTimeout)
+            .unwrap();
+
+        // Reply false if the log doesn't match at prevLogIndex
+        if self.log.len() <= args.prev_log_idx as usize
+            || self.log[args.prev_log_idx as usize].term != args.prev_log_term
+        {
+            return false_reply;
+        }
+
+        // Find conflict
+        let check_end = std::cmp::min(
+            self.log.len(),
+            args.prev_log_idx as usize + 1 + args.entries.len(),
+        );
+        let mut conflict_idx = check_end;
+        for i in args.prev_log_idx as usize + 1..check_end {
+            let j = i - 1 - args.prev_log_idx as usize;
+            if self.log[i].term != args.entries[j].term {
+                conflict_idx = i;
+                break;
             }
-        } else {
-            self.event_tx
-                .as_ref()
-                .unwrap()
-                .unbounded_send(Event::ResetElectionTimeout)
-                .unwrap();
-            AppendEntriesReply {
-                term: self.curr_term,
-                success: true,
-            }
+        }
+
+        // Delete conflict entry and all after it
+        self.log.truncate(conflict_idx);
+
+        // Append any new entries
+        self.log
+            .append(&mut args.entries[(conflict_idx - 1 - args.prev_log_idx as usize)..].to_vec());
+
+        // if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+        if args.leader_commit > self.commit_idx {
+            info!(
+                "[{}] commit_idx {} < leader_commit {}",
+                self.me, self.commit_idx, args.leader_commit
+            );
+            self.commit_idx = std::cmp::min(
+                args.leader_commit,
+                args.prev_log_idx + args.entries.len() as u64,
+            );
+
+            // apply
+            self.apply_committed();
+        }
+
+        AppendEntriesReply {
+            term: self.curr_term,
+            success: true,
         }
     }
 
@@ -362,7 +463,7 @@ impl Raft {
                     self.send_heartbeats();
                 }
             }
-            Event::RequestVoteReplyMsg((from, reply)) => {
+            Event::RequestVoteReplyMsg((from, reply, args)) => {
                 info!(
                     "[{}] get RequestVote reply from [{}], term={}, granted={}",
                     self.me, from, reply.term, reply.vote_granted
@@ -373,43 +474,86 @@ impl Raft {
                     return;
                 }
 
-                if reply.term > self.curr_term {
-                    self.as_follower(reply.term);
-                } else if reply.term == self.curr_term {
-                    if reply.vote_granted {
-                        self.votes_received += 1;
-                        if self.votes_received >= self.majority() {
-                            self.as_leader();
-                            self.send_heartbeats();
-                        }
+                // term confusion!
+                if reply.term != args.term {
+                    return;
+                }
+
+                if reply.term == self.curr_term && reply.vote_granted {
+                    self.votes_received += 1;
+                    if self.votes_received >= self.majority() {
+                        self.as_leader();
+                        self.send_heartbeats();
                     }
-                } else {
-                    unreachable!()
                 }
             }
-            Event::AppendEntriesReplyMsg((from, reply)) => {
+            Event::AppendEntriesReplyMsg((from, reply, args)) => {
                 info!(
-                    "[{}] get AppendEntries reply from [{}], term={}, success={}",
-                    self.me, from, reply.term, reply.success
+                    "[{}] term={} get AppendEntries reply from [{}], term={}, success={}",
+                    self.me, self.curr_term, from, reply.term, reply.success
                 );
 
-                self.handle_term(reply.term);
+                let term_passed = self.handle_term(reply.term);
+                if term_passed {
+                    info!(
+                        "[{}] AppendEntries to [{}] failed, because term passed",
+                        self.me, from
+                    );
+                    return;
+                }
+
+                // term confusion!
+                if reply.term != args.term {
+                    return;
+                }
+
+                if reply.success {
+                    info!("[{}] AppendEntries to [{}] succeeded.", self.me, from);
+                    self.next_idx[from] = args.prev_log_idx + args.entries.len() as u64 + 1;
+                    self.match_idx[from] = args.prev_log_idx + args.entries.len() as u64;
+                } else {
+                    // There are two reasons for failing: term passed, log inconsitency.
+                    // We would have already returned if term passed, so must be due to log inconsistency.
+                    info!(
+                        "[{}] AppendEntries to [{}] failed because of log inconsistency.",
+                        self.me, from
+                    );
+                    self.next_idx[from] -= 1;
+                    self.send_append_entries(from, self.append_entries_arg(from));
+                }
+
+                for n in self.commit_idx + 1..self.log.len() as u64 {
+                    let replicated_on = 1 + self
+                        .other_peers()
+                        .filter(|p| self.match_idx[*p] >= n)
+                        .count();
+                    if replicated_on as u64 >= self.majority()
+                        && self.log[n as usize].term == self.curr_term
+                    {
+                        self.commit_idx = n;
+                    }
+                }
+                self.apply_committed();
             }
         }
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
+        if self.role == Role::Leader {
+            let index = self.log.len() as u64;
+            let term = self.curr_term;
 
-        if is_leader {
+            let mut buf = vec![];
+            labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+
+            self.log.push(Entry {
+                term,
+                cmd: buf.clone(),
+            });
+
             Ok((index, term))
         } else {
             Err(Error::NotLeader)
@@ -436,14 +580,10 @@ impl Raft {
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
         self.persist();
-        let _ = &self.me;
         let _ = &self.persister;
-        let _ = &self.peers;
-        let _ = &self.apply_ch;
     }
 }
 
@@ -494,7 +634,7 @@ impl Node {
 
         let reset_elec_timeout = || {
             futures_timer::Delay::new(Duration::from_millis(
-                rand::thread_rng().gen_range(100, 500),
+                rand::thread_rng().gen_range(300, 500),
             ))
             .fuse() // select! requires FuseFuture
         };
@@ -548,7 +688,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        crate::your_code_here(command)
+        self.raft.lock().unwrap().start(command)
     }
 
     /// The current term of this peer.
