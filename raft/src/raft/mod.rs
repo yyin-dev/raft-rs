@@ -420,9 +420,10 @@ impl Raft {
 
         self.handle_term(args.term);
 
-        let false_reply = AppendEntriesReply {
+        let mut false_reply = AppendEntriesReply {
             term: self.curr_term,
             success: false,
+            conflict_idx: 0,
         };
 
         if args.term < self.curr_term {
@@ -436,10 +437,23 @@ impl Raft {
             .unbounded_send(Event::ResetElectionTimeout)
             .unwrap();
 
+        // (Simplified) fast rollback using only conflict_index
+        // Described in https://thesquareplanet.com/blog/students-guide-to-raft/
+
         // Reply false if the log doesn't match at prevLogIndex
-        if self.log.len() <= args.prev_log_idx as usize
-            || self.log[args.prev_log_idx as usize].term != args.prev_log_term
-        {
+        if self.log.len() <= args.prev_log_idx as usize {
+            false_reply.conflict_idx = self.log.len() as u64;
+            return false_reply;
+        }
+
+        if self.log[args.prev_log_idx as usize].term != args.prev_log_term {
+            let conflict_term = self.log[args.prev_log_idx as usize].term;
+            let mut conflict_idx = args.prev_log_idx as usize;
+            while conflict_idx > 0 && self.log[conflict_idx - 1].term == conflict_term {
+                conflict_idx -= 1;
+            }
+
+            false_reply.conflict_idx = conflict_idx as u64;
             return false_reply;
         }
 
@@ -483,6 +497,7 @@ impl Raft {
         AppendEntriesReply {
             term: self.curr_term,
             success: true,
+            conflict_idx: conflict_idx as u64,
         }
     }
 
@@ -527,8 +542,8 @@ impl Raft {
             }
             Event::AppendEntriesReplyMsg((from, reply, args)) => {
                 info!(
-                    "[{}] term={} get AppendEntries reply from [{}], term={}, success={}, args={:?}",
-                    self.me, self.curr_term, from, reply.term, reply.success, args
+                    "[{}] term={} get AppendEntries reply from [{}], term={}, success={}",
+                    self.me, self.curr_term, from, reply.term, reply.success
                 );
 
                 let term_passed = self.handle_term(reply.term);
@@ -546,22 +561,24 @@ impl Raft {
                 }
 
                 if reply.success {
-                    info!("[{}] AppendEntries to [{}] succeeded.", self.me, from);
                     self.next_idx[from] = args.prev_log_idx + args.entries.len() as u64 + 1;
                     self.match_idx[from] = args.prev_log_idx + args.entries.len() as u64;
                 } else {
                     // There are two reasons for failing: term passed, log inconsitency.
                     // We would have already returned if term passed, so must be due to log inconsistency.
+
                     info!(
-                        "[{}] AppendEntries to [{}] failed because of log inconsistency. next_idx={} will be decremented",
-                        self.me, from, self.next_idx[from],
+                        "[{}] AppendEntries to [{}] failed because of log inconsistency",
+                        self.me, from,
                     );
 
-                    // Simply decrement self.next_idx[from] is wrong.
+                    // Fast rollback
+                    // Simply setting self.next_idx[from] is wrong.
                     // Reason: in unreliable network, message can be repeated. So you can get repeated
-                    // "log inconsistency" replies for one AppendEntries RPC. Do NOT decrement
-                    // next_idx more than you should!
-                    self.next_idx[from] = std::cmp::min(self.next_idx[from], args.prev_log_idx);
+                    // "log inconsistency" replies for one AppendEntries RPC. This can cause you to
+                    // decrease next_idx more than you should (with normal rollback), or increase
+                    // next_idx by mistake (with fast rollback).
+                    self.next_idx[from] = std::cmp::min(self.next_idx[from], reply.conflict_idx);
 
                     self.send_append_entries(from, self.append_entries_arg(from));
                 }

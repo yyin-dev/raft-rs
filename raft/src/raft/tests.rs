@@ -925,6 +925,7 @@ fn test_unreliable_agree_2c() {
     cfg.end();
 }
 
+// Hard
 #[test]
 fn test_figure_8_unreliable_2c() {
     let servers = 5;
@@ -1158,6 +1159,7 @@ fn test_reliable_churn_2c() {
     internal_churn(false);
 }
 
+// Hard
 #[test]
 fn test_unreliable_churn_2c() {
     internal_churn(true);
