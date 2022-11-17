@@ -257,6 +257,15 @@ impl Raft {
         }
     }
 
+    fn other_peers(&self) -> impl Iterator<Item = usize> + '_ {
+        let range = 0..self.peers.len();
+        range.into_iter().filter(move |p| *p != self.me)
+    }
+
+    fn majority(&self) -> u64 {
+        self.peers.len() as u64 / 2 + 1
+    }
+
     fn request_vote_arg(&self) -> RequestVoteArgs {
         let last_log_idx = self.log.len() as u64 - 1;
         let last_log_term = self.log.get(last_log_idx as usize).unwrap().term;
@@ -279,15 +288,6 @@ impl Raft {
             entries: self.log[self.next_idx[peer] as usize..].to_vec(),
             leader_commit: self.commit_idx,
         }
-    }
-
-    fn other_peers(&self) -> impl Iterator<Item = usize> + '_ {
-        let range = 0..self.peers.len();
-        range.into_iter().filter(move |p| *p != self.me)
-    }
-
-    fn majority(&self) -> u64 {
-        self.peers.len() as u64 / 2 + 1
     }
 
     fn run_election(&mut self) {
@@ -546,10 +546,10 @@ impl Raft {
                     self.me, self.curr_term, from, reply.term, reply.success
                 );
 
-                let term_passed = self.handle_term(reply.term);
-                if term_passed {
+                self.handle_term(reply.term);
+                if self.role != Role::Leader {
                     info!(
-                        "[{}] AppendEntries to [{}] failed, because term passed",
+                        "[{}] AppendEntries to [{}] failed: term passed",
                         self.me, from
                     );
                     return;
@@ -568,7 +568,7 @@ impl Raft {
                     // We would have already returned if term passed, so must be due to log inconsistency.
 
                     info!(
-                        "[{}] AppendEntries to [{}] failed because of log inconsistency",
+                        "[{}] AppendEntries to [{}] failed: log inconsistency",
                         self.me, from,
                     );
 
@@ -583,6 +583,7 @@ impl Raft {
                     self.send_append_entries(from, self.append_entries_arg(from));
                 }
 
+                // Advance commit_idx
                 for n in self.commit_idx + 1..self.log.len() as u64 {
                     let replicated_on = 1 + self
                         .other_peers()
@@ -820,8 +821,8 @@ impl RaftService for Node {
     // example RequestVote RPC handler.
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
+    // TODO(yy): can implement with the event loop to avoid locking.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        // Your code here (2A, 2B).
         Ok(self.raft.lock().unwrap().handle_request_vote(args))
     }
 
