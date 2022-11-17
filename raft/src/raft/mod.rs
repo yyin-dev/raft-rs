@@ -1,4 +1,4 @@
-use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{channel, unbounded, Sender, UnboundedReceiver, UnboundedSender};
 use futures::executor::ThreadPool;
 use futures::task::SpawnExt;
 use futures::{select, FutureExt, StreamExt};
@@ -81,7 +81,9 @@ enum Event {
     ResetElectionTimeout,
     ElectionTimeout,
     HeartbeatTimeout,
+    RequestVoteArgs((RequestVoteArgs, Sender<RequestVoteReply>)),
     RequestVoteReplyMsg((usize, RequestVoteReply, RequestVoteArgs)),
+    AppendEntriesArgs((AppendEntriesArgs, Sender<AppendEntriesReply>)),
     AppendEntriesReplyMsg((usize, AppendEntriesReply, AppendEntriesArgs)),
 }
 
@@ -514,6 +516,9 @@ impl Raft {
                     self.send_heartbeats();
                 }
             }
+            Event::RequestVoteArgs((args, mut tx)) => {
+                tx.try_send(self.handle_request_vote(args)).unwrap()
+            }
             Event::RequestVoteReplyMsg((from, reply, args)) => {
                 info!(
                     "[{}] get RequestVote reply from [{}], term={}, granted={}",
@@ -539,6 +544,9 @@ impl Raft {
                         self.send_heartbeats();
                     }
                 }
+            }
+            Event::AppendEntriesArgs((args, mut tx)) => {
+                tx.try_send(self.handle_append_entries(args)).unwrap()
             }
             Event::AppendEntriesReplyMsg((from, reply, args)) => {
                 info!(
@@ -666,6 +674,7 @@ impl Raft {
 pub struct Node {
     // Your code here.
     raft: Arc<Mutex<Raft>>,
+    event_tx: UnboundedSender<Event>,
     executor: ThreadPool,
 }
 
@@ -678,19 +687,16 @@ impl Node {
 
         let mut node = Node {
             raft: Arc::new(Mutex::new(raft)),
+            event_tx,
             executor: ThreadPool::new().unwrap(),
         };
 
-        node.start_event_loop(event_tx, event_rx);
+        node.start_event_loop(event_rx);
 
         node
     }
 
-    fn start_event_loop(
-        &mut self,
-        event_tx: UnboundedSender<Event>,
-        mut event_rx: UnboundedReceiver<Event>,
-    ) {
+    fn start_event_loop(&mut self, mut event_rx: UnboundedReceiver<Event>) {
         let raft = self.raft.clone();
 
         let reset_elec_timeout = || {
@@ -705,6 +711,7 @@ impl Node {
             || futures_timer::Delay::new(Duration::from_millis(100)).fuse(); // select! requires FuseFuture
         let mut heartbeat_timeout = reset_heartbeat_timeout();
 
+        let event_tx = self.event_tx.clone();
         self.executor
             .spawn(async move {
                 loop {
@@ -821,12 +828,29 @@ impl RaftService for Node {
     // example RequestVote RPC handler.
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    // TODO(yy): can implement with the event loop to avoid locking.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        Ok(self.raft.lock().unwrap().handle_request_vote(args))
+        // With locking
+        // Ok(self.raft.lock().unwrap().handle_request_vote(args))
+
+        // Without locking
+        let (tx, mut rx) = channel(1);
+        self.event_tx
+            .unbounded_send(Event::RequestVoteArgs((args, tx)))
+            .unwrap();
+
+        Ok(rx.next().await.unwrap())
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
-        Ok(self.raft.lock().unwrap().handle_append_entries(args))
+        // With locking
+        // Ok(self.raft.lock().unwrap().handle_append_entries(args))
+
+        // Without locking
+        let (tx, mut rx) = channel(1);
+        self.event_tx
+            .unbounded_send(Event::AppendEntriesArgs((args, tx)))
+            .unwrap();
+
+        Ok(rx.next().await.unwrap())
     }
 }
