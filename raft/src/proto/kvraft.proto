@@ -10,11 +10,11 @@ enum Op {
 
 /// Put or Append
 message PutAppendRequest {
-    string key = 1;
-    string value = 2;
-    // "Put" or "Append"
-    Op op = 3;
-    // You'll have to add definitions here.
+    Op op = 1;
+    string key = 2;
+    string value = 3;
+    string cid = 4;
+    uint64 seq_num = 5;
 }
 
 message PutAppendReply {
@@ -24,7 +24,8 @@ message PutAppendReply {
 
 message GetRequest {
     string key = 1;
-    // You'll have to add definitions here.
+    string cid = 2;
+    uint64 seq_num = 3;
 }
 
 message GetReply {

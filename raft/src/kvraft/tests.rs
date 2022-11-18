@@ -646,30 +646,33 @@ fn test_one_partition_3a() {
     let (done1_tx, done1_rx) = oneshot::channel::<&'static str>();
 
     cfg.begin("Test: no progress in minority (3A)");
-    cfg.net.spawn(future::lazy(move |_| {
-        ckp2a.put("1".to_owned(), "15".to_owned());
+    // Tweak to avoid panic: cannot execute `LocalPool` executor from within another executor: EnterError
+    // Rust doesn't allow recusive calls of block_on 
+    // Reference: https://github.com/BugenZhao/Raft/blob/2e763b14ec8b6cbcecbb1eb29c83d50d1d90c027/raft/src/kvraft/tests.rs#L648
+    cfg.net.spawn(async move {
+        ckp2a.put_async("1".to_owned(), "15".to_owned()).await;
         done0_tx
             .send("put")
             .map_err(|e| {
                 warn!("done0 send failed: {:?}", e);
             })
             .unwrap();
-    }));
+    });
     let done0_rx = done0_rx.map(|op| {
         cfg.op();
         op
     });
 
-    cfg.net.spawn(future::lazy(move |_| {
+    cfg.net.spawn(async move {
         // different clerk in p2
-        ckp2b.get("1".to_owned());
+        ckp2b.get_async("1".to_owned()).await;
         done1_tx
             .send("get")
             .map_err(|e| {
                 warn!("done0 send failed: {:?}", e);
             })
             .unwrap();
-    }));
+    });
     let done1_rx = done1_rx.map(|op| {
         cfg.op();
         op

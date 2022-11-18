@@ -5,9 +5,6 @@ pub mod raftpb {
         service raft {
             rpc request_vote(RequestVoteArgs) returns (RequestVoteReply);
             rpc append_entries(AppendEntriesArgs) returns (AppendEntriesReply);
-
-            // Your code here if more rpc desired.
-            // rpc xxx(yyy) returns (zzz)
         }
     }
     pub use self::raft::{
@@ -22,9 +19,6 @@ pub mod kvraftpb {
         service kv {
             rpc get(GetRequest) returns (GetReply);
             rpc put_append(PutAppendRequest) returns (PutAppendReply);
-
-            // Your code here if more rpc desired.
-            // rpc xxx(yyy) returns (zzz)
         }
     }
     pub use self::kv::{add_service as add_kv_service, Client as KvClient, Service as KvService};

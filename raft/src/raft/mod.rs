@@ -675,7 +675,7 @@ pub struct Node {
     // Your code here.
     raft: Arc<Mutex<Raft>>,
     event_tx: UnboundedSender<Event>,
-    executor: ThreadPool,
+    pub executor: ThreadPool,
 }
 
 impl Node {

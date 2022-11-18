@@ -1,14 +1,62 @@
-use futures::channel::mpsc::unbounded;
+use futures::channel::mpsc::{channel, unbounded, Sender, UnboundedReceiver, UnboundedSender};
+use futures::executor::ThreadPool;
+use futures::task::SpawnExt;
+use futures::{select, StreamExt};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::proto::kvraftpb::*;
-use crate::raft;
+use crate::raft::{self, ApplyMsg};
+
+struct AppliedCmd {
+    cid: String,
+    seq_num: u64,
+    value: Option<String>,
+}
+
+type OpResultTx = Sender<Result<AppliedCmd, raft::errors::Error>>;
+
+enum Event {
+    Get((GetRequest, OpResultTx)),
+    PutAppend((PutAppendRequest, OpResultTx)),
+}
+
+impl std::fmt::Display for GetRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Get({}, {}, {})", self.key, self.cid, self.seq_num)
+    }
+}
+
+impl std::fmt::Display for PutAppendRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.op {
+            0 => write!(f, "Unknown"),
+            1 => write!(
+                f,
+                "Put({}, '{}', {}, {})",
+                self.key, self.value, self.cid, self.seq_num
+            ),
+            2 => {
+                write!(
+                    f,
+                    "Append({}, '{}', {}, {})",
+                    self.key, self.value, self.cid, self.seq_num
+                )
+            }
+            _ => unimplemented!(),
+        }
+    }
+}
 
 pub struct KvServer {
     pub rf: raft::Node,
-    me: usize,
+    pub me: usize,
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
-    // Your definitions here.
+
+    data: HashMap<String, String>,
+    apply_ch: Option<UnboundedReceiver<ApplyMsg>>,
+    started_cmds: HashMap<u64, OpResultTx>,
 }
 
 impl KvServer {
@@ -18,12 +66,98 @@ impl KvServer {
         persister: Box<dyn raft::persister::Persister>,
         maxraftstate: Option<usize>,
     ) -> KvServer {
-        // You may need initialization code here.
-
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
 
-        crate::your_code_here((rf, maxraftstate, apply_ch))
+        let server = KvServer {
+            rf: raft::Node::new(rf),
+            me,
+            maxraftstate,
+            data: HashMap::new(),
+            apply_ch: Some(apply_ch),
+            started_cmds: HashMap::new(),
+        };
+
+        server
+    }
+
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::Get((arg, mut tx)) => match self.rf.start(&arg) {
+                Ok((idx, _)) => {
+                    info!("[{}] starts {}", self.me, arg);
+                    self.started_cmds.insert(idx, tx);
+                }
+                Err(e) => {
+                    tx.try_send(Err(e)).unwrap();
+                }
+            },
+            Event::PutAppend((arg, mut tx)) => match self.rf.start(&arg) {
+                Ok((idx, _)) => {
+                    info!("[{}] starts {}", self.me, arg);
+                    self.started_cmds.insert(idx, tx);
+                }
+                Err(e) => {
+                    tx.try_send(Err(e)).unwrap();
+                }
+            },
+        };
+    }
+
+    fn apply(&mut self, apply_msg: raft::ApplyMsg) {
+        match apply_msg {
+            ApplyMsg::Command { data, index } => {
+                let applied_cmd = if let Ok(get_request) = labcodec::decode::<GetRequest>(&data) {
+                    info!("[{}] applies {}", self.me, get_request);
+                    let value = match self.data.get(&get_request.key) {
+                        None => String::new(),
+                        Some(v) => v.clone(),
+                    };
+
+                    AppliedCmd {
+                        cid: get_request.cid,
+                        seq_num: get_request.seq_num,
+                        value: Some(value),
+                    }
+                } else if let Ok(put_append_request) = labcodec::decode::<PutAppendRequest>(&data) {
+                    info!("[{}] applies {}", self.me, put_append_request);
+                    match put_append_request.op {
+                        0 => panic!("unknown op?"),
+                        1 => {
+                            /* put */
+                            self.data.insert(
+                                put_append_request.key.clone(),
+                                put_append_request.value.clone(),
+                            );
+                        }
+                        2 => {
+                            /* append */
+                            self.data
+                                .get_mut(&put_append_request.key)
+                                .unwrap()
+                                .push_str(&put_append_request.value);
+                        }
+                        op => panic!("unexpected op: {}", op),
+                    };
+                    AppliedCmd {
+                        cid: put_append_request.cid,
+                        seq_num: put_append_request.seq_num,
+                        value: None,
+                    }
+                } else {
+                    panic!("decode error");
+                };
+
+                self.started_cmds
+                    .remove(&index)
+                    .map(|mut tx| tx.try_send(Ok(applied_cmd)).unwrap());
+            }
+            ApplyMsg::Snapshot {
+                data: _,
+                term: _,
+                index: _,
+            } => todo!(),
+        }
     }
 }
 
@@ -52,13 +186,50 @@ impl KvServer {
 // ```
 #[derive(Clone)]
 pub struct Node {
-    // Your definitions here.
+    me: usize,
+    server: Arc<Mutex<KvServer>>,
+    event_tx: UnboundedSender<Event>,
 }
 
 impl Node {
-    pub fn new(kv: KvServer) -> Node {
-        // Your code here.
-        crate::your_code_here(kv);
+    pub fn new(mut kv: KvServer) -> Node {
+        let (event_tx, event_rx) = unbounded();
+        let executor = kv.rf.executor.clone();
+        let apply_ch = kv.apply_ch.take().unwrap();
+
+        let mut node = Node {
+            me: kv.me,
+            server: Arc::new(Mutex::new(kv)),
+            event_tx,
+        };
+
+        node.event_loop(event_rx, apply_ch, executor);
+
+        node
+    }
+
+    fn event_loop(
+        &mut self,
+        mut event_rx: UnboundedReceiver<Event>,
+        mut apply_ch: UnboundedReceiver<ApplyMsg>,
+        executor: ThreadPool,
+    ) {
+        let server = self.server.clone();
+
+        executor
+            .spawn(async move {
+                loop {
+                    select! {
+                        event = event_rx.select_next_some() => {
+                            server.lock().unwrap().handle_event(event);
+                        }
+                        apply_msg = apply_ch.select_next_some() => {
+                            server.lock().unwrap().apply(apply_msg);
+                        }
+                    }
+                }
+            })
+            .unwrap()
     }
 
     /// the tester calls kill() when a KVServer instance won't
@@ -85,10 +256,7 @@ impl Node {
     }
 
     pub fn get_state(&self) -> raft::State {
-        // Your code here.
-        raft::State {
-            ..Default::default()
-        }
+        self.server.lock().unwrap().rf.get_state()
     }
 }
 
@@ -96,13 +264,53 @@ impl Node {
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
-        // Your code here.
-        crate::your_code_here(arg)
+        info!("[{}] receives {}", self.me, arg);
+
+        let (tx, mut rx) = channel(1);
+        self.event_tx
+            .unbounded_send(Event::Get((arg.clone(), tx)))
+            .unwrap();
+        let res = match rx.next().await.unwrap() {
+            Ok(applied_cmd) => Ok(GetReply {
+                wrong_leader: false,
+                err: String::new(),
+                value: applied_cmd.value.unwrap(),
+            }),
+            Err(raft::errors::Error::NotLeader) => Ok(GetReply {
+                wrong_leader: true,
+                err: String::new(),
+                value: String::new(),
+            }),
+            Err(e) => Err(labrpc::Error::Other(format!("some error: {}", e))),
+        };
+
+        info!("[{}] {} -> {:?}", self.me, arg, res);
+        res
     }
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn put_append(&self, arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
-        // Your code here.
-        crate::your_code_here(arg)
+        info!("[{}] receives {}", self.me, arg);
+
+        let (tx, mut rx) = channel(1);
+        self.event_tx
+            .unbounded_send(Event::PutAppend((arg.clone(), tx)))
+            .unwrap();
+
+        let res = match rx.next().await.unwrap() {
+            Ok(_) => Ok(PutAppendReply {
+                wrong_leader: false,
+                err: String::new(),
+            }),
+            Err(raft::errors::Error::NotLeader) => Ok(PutAppendReply {
+                wrong_leader: true,
+                err: String::new(),
+            }),
+            Err(e) => Err(labrpc::Error::Other(format!("some error: {}", e))),
+        };
+
+        info!("[{}] {} -> {:?}", self.me, arg, res);
+
+        res
     }
 }
