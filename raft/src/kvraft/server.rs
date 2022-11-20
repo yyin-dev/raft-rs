@@ -14,7 +14,12 @@ struct AppliedCmd {
     value: Option<String>,
 }
 
-type OpResultTx = Sender<Result<AppliedCmd, raft::errors::Error>>;
+#[derive(Debug)]
+enum ServerError {
+    WrongLeader,
+}
+
+type OpResultTx = Sender<Result<AppliedCmd, ServerError>>;
 
 enum Event {
     Get((GetRequest, OpResultTx)),
@@ -55,6 +60,7 @@ pub struct KvServer {
     maxraftstate: Option<usize>,
 
     data: HashMap<String, String>,
+    latest_seq_nums: HashMap<String, u64>,
     apply_ch: Option<UnboundedReceiver<ApplyMsg>>,
     started_cmds: HashMap<u64, OpResultTx>,
 }
@@ -74,11 +80,30 @@ impl KvServer {
             me,
             maxraftstate,
             data: HashMap::new(),
+            latest_seq_nums: HashMap::new(),
             apply_ch: Some(apply_ch),
             started_cmds: HashMap::new(),
         };
 
         server
+    }
+
+    fn is_duplicate(&mut self, cid: &str, seq_num: u64) -> bool {
+        if !self.latest_seq_nums.contains_key(cid) {
+            self.latest_seq_nums.insert(cid.to_string(), 0);
+        }
+
+        *self.latest_seq_nums.get(cid).unwrap() >= seq_num
+    }
+
+    fn record_seen_seq_num(&mut self, cid: &str, seq_num: u64) {
+        if !self.latest_seq_nums.contains_key(cid) {
+            self.latest_seq_nums.insert(cid.to_string(), 0);
+        }
+
+        assert!(*self.latest_seq_nums.get(cid).unwrap() <= seq_num);
+
+        self.latest_seq_nums.insert(cid.to_string(), seq_num);
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -88,8 +113,8 @@ impl KvServer {
                     info!("[{}] starts {}", self.me, arg);
                     self.started_cmds.insert(idx, tx);
                 }
-                Err(e) => {
-                    tx.try_send(Err(e)).unwrap();
+                Err(_) => {
+                    tx.try_send(Err(ServerError::WrongLeader)).unwrap();
                 }
             },
             Event::PutAppend((arg, mut tx)) => match self.rf.start(&arg) {
@@ -97,8 +122,8 @@ impl KvServer {
                     info!("[{}] starts {}", self.me, arg);
                     self.started_cmds.insert(idx, tx);
                 }
-                Err(e) => {
-                    tx.try_send(Err(e)).unwrap();
+                Err(_) => {
+                    tx.try_send(Err(ServerError::WrongLeader)).unwrap();
                 }
             },
         };
@@ -107,6 +132,31 @@ impl KvServer {
     fn apply(&mut self, apply_msg: raft::ApplyMsg) {
         match apply_msg {
             ApplyMsg::Command { data, index } => {
+                let (cid, seq_num, key, is_get) =
+                    if let Ok(req) = labcodec::decode::<GetRequest>(&data) {
+                        (req.cid, req.seq_num, req.key, true)
+                    } else if let Ok(req) = labcodec::decode::<PutAppendRequest>(&data) {
+                        (req.cid, req.seq_num, req.key, false)
+                    } else {
+                        panic!("decode error");
+                    };
+
+                if self.is_duplicate(&cid, seq_num) {
+                    let applied_cmd = AppliedCmd {
+                        cid,
+                        seq_num,
+                        value: if is_get {
+                            Some(self.data.get(&key).cloned().unwrap_or(String::new()))
+                        } else {
+                            None
+                        },
+                    };
+                    self.started_cmds
+                        .remove(&index)
+                        .map(|mut tx| tx.try_send(Ok(applied_cmd)));
+                    return;
+                }
+
                 let applied_cmd = if let Ok(get_request) = labcodec::decode::<GetRequest>(&data) {
                     info!("[{}] applies {}", self.me, get_request);
                     let value = match self.data.get(&get_request.key) {
@@ -134,11 +184,11 @@ impl KvServer {
                             /* append */
                             self.data
                                 .get_mut(&put_append_request.key)
-                                .unwrap()
-                                .push_str(&put_append_request.value);
+                                .map(|s| s.push_str(&put_append_request.value));
                         }
                         op => panic!("unexpected op: {}", op),
                     };
+
                     AppliedCmd {
                         cid: put_append_request.cid,
                         seq_num: put_append_request.seq_num,
@@ -148,9 +198,11 @@ impl KvServer {
                     panic!("decode error");
                 };
 
+                self.record_seen_seq_num(&cid, seq_num);
+
                 self.started_cmds
                     .remove(&index)
-                    .map(|mut tx| tx.try_send(Ok(applied_cmd)).unwrap());
+                    .map(|mut tx| tx.try_send(Ok(applied_cmd)));
             }
             ApplyMsg::Snapshot {
                 data: _,
@@ -271,17 +323,26 @@ impl KvService for Node {
             .unbounded_send(Event::Get((arg.clone(), tx)))
             .unwrap();
         let res = match rx.next().await.unwrap() {
-            Ok(applied_cmd) => Ok(GetReply {
-                wrong_leader: false,
-                err: String::new(),
-                value: applied_cmd.value.unwrap(),
-            }),
-            Err(raft::errors::Error::NotLeader) => Ok(GetReply {
+            Ok(applied_cmd) => {
+                if applied_cmd.cid == arg.cid && applied_cmd.seq_num == arg.seq_num {
+                    Ok(GetReply {
+                        wrong_leader: false,
+                        err: String::new(),
+                        value: applied_cmd.value.unwrap(),
+                    })
+                } else {
+                    Ok(GetReply {
+                        wrong_leader: false,
+                        err: String::from("not committed"),
+                        value: String::new(),
+                    })
+                }
+            }
+            Err(ServerError::WrongLeader) => Ok(GetReply {
                 wrong_leader: true,
                 err: String::new(),
                 value: String::new(),
             }),
-            Err(e) => Err(labrpc::Error::Other(format!("some error: {}", e))),
         };
 
         info!("[{}] {} -> {:?}", self.me, arg, res);
@@ -298,15 +359,23 @@ impl KvService for Node {
             .unwrap();
 
         let res = match rx.next().await.unwrap() {
-            Ok(_) => Ok(PutAppendReply {
-                wrong_leader: false,
-                err: String::new(),
-            }),
-            Err(raft::errors::Error::NotLeader) => Ok(PutAppendReply {
+            Ok(applied_cmd) => {
+                if applied_cmd.cid == arg.cid && applied_cmd.seq_num == arg.seq_num {
+                    Ok(PutAppendReply {
+                        wrong_leader: false,
+                        err: String::new(),
+                    })
+                } else {
+                    Ok(PutAppendReply {
+                        wrong_leader: false,
+                        err: String::from("not committed"),
+                    })
+                }
+            }
+            Err(ServerError::WrongLeader) => Ok(PutAppendReply {
                 wrong_leader: true,
                 err: String::new(),
             }),
-            Err(e) => Err(labrpc::Error::Other(format!("some error: {}", e))),
         };
 
         info!("[{}] {} -> {:?}", self.me, arg, res);

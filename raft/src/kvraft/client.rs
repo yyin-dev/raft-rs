@@ -1,8 +1,8 @@
 use futures::executor::block_on;
-use nanoid::nanoid;
 use std::fmt;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::time::Duration;
 
 use crate::proto::kvraftpb::*;
 
@@ -27,12 +27,13 @@ impl fmt::Debug for Clerk {
 
 impl Clerk {
     pub fn new(name: String, servers: Vec<KvClient>) -> Clerk {
+        let name_ = name.clone();
         Clerk {
             name,
             servers,
             curr_leader: AtomicUsize::new(0),
-            cid: nanoid!(),
-            next_seq_num: AtomicU64::new(0),
+            cid: name_,
+            next_seq_num: AtomicU64::new(1),
         }
     }
 
@@ -48,15 +49,31 @@ impl Clerk {
             cid: self.cid.clone(),
             seq_num: self.next_seq_num(),
         };
+        info!("<{}> starts {}", self.name, args);
 
         let mut s = self.curr_leader.load(SeqCst);
         loop {
-            let res = self.servers[s].get(&args).await;
-            if let Ok(reply) = res {
-                if !reply.wrong_leader {
-                    self.curr_leader.store(s, SeqCst);
-                    return reply.value;
+            let res = self.servers[s].get(&args);
+            let timeout = futures_timer::Delay::new(Duration::from_millis(500));
+
+            // The select! macro requires FusedFuture trait, but the select function does not.
+            match futures::future::select(res, timeout).await {
+                futures::future::Either::Left((res, _)) => {
+                    if let Ok(reply) = res {
+                        if !reply.wrong_leader && reply.err.is_empty() {
+                            info!("<{}> {} -> {}", self.name, args, reply.value);
+                            self.curr_leader.store(s, SeqCst);
+                            return reply.value;
+                        }
+                        info!(
+                            "<{}> {} to {} failed. Wrong leader: {}, err: {}. Will retry",
+                            self.name, args, s, reply.wrong_leader, reply.err
+                        );
+                    } else {
+                        info!("{} fails: {:?}. Will retry", args, res);
+                    }
                 }
+                futures::future::Either::Right(_) => {}
             }
 
             s = (s + 1) % self.servers.len();
@@ -88,19 +105,31 @@ impl Clerk {
                 seq_num: self.next_seq_num(),
             },
         };
+        info!("<{}> starts {}", self.name, args);
 
         let mut s = self.curr_leader.load(SeqCst);
         loop {
-            let res = self.servers[s].put_append(&args).await;
-            let ok = if let Ok(reply) = res {
-                !reply.wrong_leader && reply.err.is_empty()
-            } else {
-                false
-            };
+            let res = self.servers[s].put_append(&args);
+            let timeout = futures_timer::Delay::new(Duration::from_millis(800));
 
-            if ok {
-                self.curr_leader.store(s, SeqCst);
-                break;
+            match futures::future::select(res, timeout).await {
+                futures::future::Either::Left((res, _)) => {
+                    if let Ok(reply) = res {
+                        if !reply.wrong_leader && reply.err.is_empty() {
+                            self.curr_leader.store(s, SeqCst);
+                            info!("<{}> {} done", self.name, args);
+                            return;
+                        }
+
+                        info!(
+                            "<{}> {} fails. Wrong leader: {}, err: {}, will retry",
+                            self.name, args, reply.wrong_leader, reply.err
+                        );
+                    } else {
+                        info!("{} fails: {:?}. Will retry", args, res);
+                    }
+                }
+                futures::future::Either::Right(_) => {}
             }
 
             s = (s + 1) % self.servers.len();
