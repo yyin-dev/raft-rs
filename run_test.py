@@ -1,6 +1,6 @@
 import os
 
-num_tests = 20
+num_tests = 30
 
 
 if __name__ == "__main__":
@@ -9,13 +9,12 @@ if __name__ == "__main__":
 
         # with log
         file_name = "./logs/test" + str(i) + ".log"
-        os.system(f"LOG_LEVEL=info make cargo_test_2c >{file_name} 2>&1")
+        os.system(f"make cargo_test_3a >{file_name} 2>&1")
 
         with open(file_name) as f:
             if 'FAILED' in f.read():
                 print(file_name + " fails")
-                continue
             else:
                 print(file_name + " ok")
+                os.system("rm " + file_name)
 
-        os.system("rm " + file_name)

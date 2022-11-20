@@ -182,9 +182,13 @@ impl KvServer {
                         }
                         2 => {
                             /* append */
+                            // Caveat: if there's no existing record, append should still happen! 
+                            // If you ignore append when there's no record, you will pass all 
+                            // tests except the linearizability. Super confusing!
                             self.data
-                                .get_mut(&put_append_request.key)
-                                .map(|s| s.push_str(&put_append_request.value));
+                                .entry(put_append_request.key.clone())
+                                .or_default()
+                                .push_str(&put_append_request.value);
                         }
                         op => panic!("unexpected op: {}", op),
                     };
@@ -332,7 +336,7 @@ impl KvService for Node {
                     })
                 } else {
                     Ok(GetReply {
-                        wrong_leader: false,
+                        wrong_leader: true,
                         err: String::from("not committed"),
                         value: String::new(),
                     })
@@ -367,7 +371,7 @@ impl KvService for Node {
                     })
                 } else {
                     Ok(PutAppendReply {
-                        wrong_leader: false,
+                        wrong_leader: true,
                         err: String::from("not committed"),
                     })
                 }

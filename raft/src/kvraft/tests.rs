@@ -647,7 +647,7 @@ fn test_one_partition_3a() {
 
     cfg.begin("Test: no progress in minority (3A)");
     // Tweak to avoid panic: cannot execute `LocalPool` executor from within another executor: EnterError
-    // Rust doesn't allow recusive calls of block_on 
+    // Rust doesn't allow recusive calls of block_on
     // Reference: https://github.com/BugenZhao/Raft/blob/2e763b14ec8b6cbcecbb1eb29c83d50d1d90c027/raft/src/kvraft/tests.rs#L648
     cfg.net.spawn(async move {
         ckp2a.put_async("1".to_owned(), "15".to_owned()).await;
