@@ -36,6 +36,16 @@ use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
 
+/// Macro for logging message combined with state of the Raft peer.
+macro_rules! rlog {
+    (level: $level:ident, $raft:expr, $($arg:tt)+) => {
+        ::log::$level!("[#{} @{} as {:?}] {}", $raft.me, $raft.curr_term, $raft.role, format_args!($($arg)+))
+    };
+    ($raft:expr, $($arg:tt)+) => {
+        rlog!(level: info, $raft, $($arg)+)
+    };
+}
+
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
 /// server, via the `apply_ch` passed to `Raft::new`.
@@ -70,7 +80,7 @@ impl State {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 enum Role {
     Follower,
     Candidate,
@@ -229,7 +239,7 @@ impl Raft {
     }
 
     fn as_follower(&mut self, new_term: u64) {
-        info!("[{}] -> follower, term={}", self.me, new_term);
+        rlog!(self, "-> follower, term={}", new_term);
         self.curr_term = new_term;
         self.role = Role::Follower;
         self.voted_for = None;
@@ -240,13 +250,13 @@ impl Raft {
         self.role = Role::Candidate;
         self.voted_for = Some(self.me);
         self.votes_received = 1;
-        info!("[{}] -> candidate, term={}", self.me, self.curr_term);
+        rlog!(self, "-> candidate, term={}", self.curr_term);
     }
 
     fn as_leader(&mut self) {
-        info!(
-            "[{}] -> leader, term={}, log: {}",
-            self.me,
+        rlog!(
+            self,
+            "-> leader, term={}, log: {}",
             self.curr_term,
             entries_to_str(&self.log)
         );
@@ -299,7 +309,7 @@ impl Raft {
 
         // send RequestVote to others in parallel
         for p in self.other_peers() {
-            info!("[{}] send RequestVote to [{}]", self.me, p);
+            rlog!(self, "send RequestVote to [{}]", p);
             self.send_request_vote(p, self.request_vote_arg());
         }
     }
@@ -400,9 +410,9 @@ impl Raft {
             self.persist();
         }
 
-        info!(
-            "[{}] RequestVote from [{}], term={}, last_log_term={}, last_log_idx={}, granted={}",
-            self.me,
+        rlog!(
+            self,
+            "RequestVote from [{}], term={}, last_log_term={}, last_log_idx={}, granted={}",
             args.candidate_id,
             args.term,
             args.last_log_term,
@@ -417,8 +427,8 @@ impl Raft {
     }
 
     fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
-        info!("[{}] curr_term: {}, received AppendEntries from [{}], term={}, prev_log_idx: {}, prev_log_term: {}, entries: {}, curr_log: {}", 
-            self.me, self.curr_term, args.leader_id, args.term, args.prev_log_idx, args.prev_log_term, entries_to_str(&args.entries), entries_to_str(&self.log));
+        rlog!(self, "curr_term: {}, received AppendEntries from [{}], term={}, prev_log_idx: {}, prev_log_term: {}, entries: {}, curr_log: {}", 
+            self.curr_term, args.leader_id, args.term, args.prev_log_idx, args.prev_log_term, entries_to_str(&args.entries), entries_to_str(&self.log));
 
         self.handle_term(args.term);
 
@@ -482,9 +492,11 @@ impl Raft {
 
         // if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
         if args.leader_commit > self.commit_idx {
-            info!(
-                "[{}] commit_idx {} < leader_commit {}",
-                self.me, self.commit_idx, args.leader_commit
+            rlog!(
+                self,
+                "commit_idx {} < leader_commit {}",
+                self.commit_idx,
+                args.leader_commit
             );
             self.commit_idx = std::cmp::min(
                 args.leader_commit,
@@ -520,9 +532,12 @@ impl Raft {
                 tx.try_send(self.handle_request_vote(args)).unwrap()
             }
             Event::RequestVoteReplyMsg((from, reply, args)) => {
-                info!(
-                    "[{}] get RequestVote reply from [{}], term={}, granted={}",
-                    self.me, from, reply.term, reply.vote_granted
+                rlog!(
+                    self,
+                    "get RequestVote reply from [{}], term={}, granted={}",
+                    from,
+                    reply.term,
+                    reply.vote_granted
                 );
 
                 self.handle_term(reply.term);
@@ -549,17 +564,18 @@ impl Raft {
                 tx.try_send(self.handle_append_entries(args)).unwrap()
             }
             Event::AppendEntriesReplyMsg((from, reply, args)) => {
-                info!(
-                    "[{}] term={} get AppendEntries reply from [{}], term={}, success={}",
-                    self.me, self.curr_term, from, reply.term, reply.success
+                rlog!(
+                    self,
+                    "term={} get AppendEntries reply from [{}], term={}, success={}",
+                    self.curr_term,
+                    from,
+                    reply.term,
+                    reply.success
                 );
 
                 self.handle_term(reply.term);
                 if self.role != Role::Leader {
-                    info!(
-                        "[{}] AppendEntries to [{}] failed: term passed",
-                        self.me, from
-                    );
+                    rlog!(self, "AppendEntries to [{}] failed: term passed", from);
                     return;
                 }
 
@@ -575,9 +591,10 @@ impl Raft {
                     // There are two reasons for failing: term passed, log inconsitency.
                     // We would have already returned if term passed, so must be due to log inconsistency.
 
-                    info!(
-                        "[{}] AppendEntries to [{}] failed: log inconsistency",
-                        self.me, from,
+                    rlog!(
+                        self,
+                        "AppendEntries to [{}] failed: log inconsistency",
+                        from,
                     );
 
                     // Fast rollback
@@ -638,11 +655,13 @@ impl Raft {
         snapshot: &[u8],
     ) -> bool {
         // Your code here (2D).
+        rlog!(self, "Raft::cond_install_snapshot");
         crate::your_code_here((last_included_term, last_included_index, snapshot));
     }
 
     fn snapshot(&mut self, index: u64, snapshot: &[u8]) {
         // Your code here (2D).
+        rlog!(self, "Raft::snapshot");
         crate::your_code_here((index, snapshot));
     }
 }
@@ -808,6 +827,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.cond_install_snapshot(last_included_term, last_included_index, snapshot)
+        info!("Node::cond_install_snapshot");
         crate::your_code_here((last_included_term, last_included_index, snapshot));
     }
 
@@ -819,6 +839,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.snapshot(index, snapshot)
+        info!("Node::snapshot");
         crate::your_code_here((index, snapshot));
     }
 }

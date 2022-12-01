@@ -182,8 +182,8 @@ impl KvServer {
                         }
                         2 => {
                             /* append */
-                            // Caveat: if there's no existing record, append should still happen! 
-                            // If you ignore append when there's no record, you will pass all 
+                            // Caveat: if there's no existing record, append should still happen!
+                            // If you ignore append when there's no record, you will pass all
                             // tests except the linearizability. Super confusing!
                             self.data
                                 .entry(put_append_request.key.clone())
