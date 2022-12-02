@@ -386,7 +386,7 @@ impl Raft {
         }
     }
 
-    fn handle_request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
+    fn handle_request_vote_request(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
         self.handle_term(args.term);
 
         if args.term < self.curr_term {
@@ -426,7 +426,42 @@ impl Raft {
         }
     }
 
-    fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+    fn handle_request_vote_reply(
+        &mut self,
+        from: usize,
+        reply: RequestVoteReply,
+        args: RequestVoteArgs,
+    ) {
+        rlog!(
+            self,
+            "get RequestVote reply from [{}], term={}, granted={}",
+            from,
+            reply.term,
+            reply.vote_granted
+        );
+
+        self.handle_term(reply.term);
+        if self.role != Role::Candidate {
+            return;
+        }
+
+        // term confusion!
+        if reply.term != args.term || args.term != self.curr_term {
+            return;
+        }
+
+        if reply.term == self.curr_term && reply.vote_granted {
+            self.votes_received += 1;
+            if self.votes_received >= self.majority() {
+                self.as_leader();
+                self.persist();
+
+                self.send_heartbeats();
+            }
+        }
+    }
+
+    fn handle_append_entries_request(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
         rlog!(self, "curr_term: {}, received AppendEntries from [{}], term={}, prev_log_idx: {}, prev_log_term: {}, entries: {}, curr_log: {}", 
             self.curr_term, args.leader_id, args.term, args.prev_log_idx, args.prev_log_term, entries_to_str(&args.entries), entries_to_str(&self.log));
 
@@ -515,6 +550,72 @@ impl Raft {
         }
     }
 
+    fn handle_append_entries_reply(
+        &mut self,
+        from: usize,
+        reply: AppendEntriesReply,
+        args: AppendEntriesArgs,
+    ) {
+        rlog!(
+            self,
+            "term={} get AppendEntries reply from [{}], term={}, success={}",
+            self.curr_term,
+            from,
+            reply.term,
+            reply.success
+        );
+
+        self.handle_term(reply.term);
+        if self.role != Role::Leader {
+            rlog!(self, "AppendEntries to [{}] failed: term passed", from);
+            return;
+        }
+
+        // term confusion!
+        if reply.term != args.term || args.term != self.curr_term {
+            return;
+        }
+
+        if reply.success {
+            self.next_idx[from] = args.prev_log_idx + args.entries.len() as u64 + 1;
+            self.match_idx[from] = args.prev_log_idx + args.entries.len() as u64;
+        } else {
+            // There are two reasons for failing: term passed, log inconsitency.
+            // We would have already returned if term passed, so must be due to log inconsistency.
+
+            rlog!(
+                self,
+                "AppendEntries to [{}] failed: log inconsistency",
+                from,
+            );
+
+            // Fast rollback
+            // Simply setting self.next_idx[from] is wrong.
+            // Reason: in unreliable network, message can be repeated. So you can get repeated
+            // "log inconsistency" replies for one AppendEntries RPC. This can cause you to
+            // decrease next_idx more than you should (with normal rollback), or increase
+            // next_idx by mistake (with fast rollback).
+            self.next_idx[from] = std::cmp::min(self.next_idx[from], reply.conflict_idx);
+
+            self.send_append_entries(from, self.append_entries_arg(from));
+        }
+
+        // Advance commit_idx
+        for n in self.commit_idx + 1..self.log.len() as u64 {
+            let replicated_on = 1 + self
+                .other_peers()
+                .filter(|p| self.match_idx[*p] >= n)
+                .count();
+            if replicated_on as u64 >= self.majority()
+                && self.log[n as usize].term == self.curr_term
+            {
+                self.commit_idx = n;
+            }
+        }
+        self.persist();
+        self.apply_committed();
+    }
+
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::ResetElectionTimeout => unreachable!(),
@@ -529,99 +630,17 @@ impl Raft {
                 }
             }
             Event::RequestVoteArgs((args, mut tx)) => {
-                tx.try_send(self.handle_request_vote(args)).unwrap()
+                tx.try_send(self.handle_request_vote_request(args)).unwrap()
             }
             Event::RequestVoteReplyMsg((from, reply, args)) => {
-                rlog!(
-                    self,
-                    "get RequestVote reply from [{}], term={}, granted={}",
-                    from,
-                    reply.term,
-                    reply.vote_granted
-                );
-
-                self.handle_term(reply.term);
-                if self.role != Role::Candidate {
-                    return;
-                }
-
-                // term confusion!
-                if reply.term != args.term || args.term != self.curr_term {
-                    return;
-                }
-
-                if reply.term == self.curr_term && reply.vote_granted {
-                    self.votes_received += 1;
-                    if self.votes_received >= self.majority() {
-                        self.as_leader();
-                        self.persist();
-
-                        self.send_heartbeats();
-                    }
-                }
+                self.handle_request_vote_reply(from, reply, args)
             }
             Event::AppendEntriesArgs((args, mut tx)) => {
-                tx.try_send(self.handle_append_entries(args)).unwrap()
+                tx.try_send(self.handle_append_entries_request(args))
+                    .unwrap();
             }
             Event::AppendEntriesReplyMsg((from, reply, args)) => {
-                rlog!(
-                    self,
-                    "term={} get AppendEntries reply from [{}], term={}, success={}",
-                    self.curr_term,
-                    from,
-                    reply.term,
-                    reply.success
-                );
-
-                self.handle_term(reply.term);
-                if self.role != Role::Leader {
-                    rlog!(self, "AppendEntries to [{}] failed: term passed", from);
-                    return;
-                }
-
-                // term confusion!
-                if reply.term != args.term || args.term != self.curr_term {
-                    return;
-                }
-
-                if reply.success {
-                    self.next_idx[from] = args.prev_log_idx + args.entries.len() as u64 + 1;
-                    self.match_idx[from] = args.prev_log_idx + args.entries.len() as u64;
-                } else {
-                    // There are two reasons for failing: term passed, log inconsitency.
-                    // We would have already returned if term passed, so must be due to log inconsistency.
-
-                    rlog!(
-                        self,
-                        "AppendEntries to [{}] failed: log inconsistency",
-                        from,
-                    );
-
-                    // Fast rollback
-                    // Simply setting self.next_idx[from] is wrong.
-                    // Reason: in unreliable network, message can be repeated. So you can get repeated
-                    // "log inconsistency" replies for one AppendEntries RPC. This can cause you to
-                    // decrease next_idx more than you should (with normal rollback), or increase
-                    // next_idx by mistake (with fast rollback).
-                    self.next_idx[from] = std::cmp::min(self.next_idx[from], reply.conflict_idx);
-
-                    self.send_append_entries(from, self.append_entries_arg(from));
-                }
-
-                // Advance commit_idx
-                for n in self.commit_idx + 1..self.log.len() as u64 {
-                    let replicated_on = 1 + self
-                        .other_peers()
-                        .filter(|p| self.match_idx[*p] >= n)
-                        .count();
-                    if replicated_on as u64 >= self.majority()
-                        && self.log[n as usize].term == self.curr_term
-                    {
-                        self.commit_idx = n;
-                    }
-                }
-                self.persist();
-                self.apply_committed();
+                self.handle_append_entries_reply(from, reply, args)
             }
         }
     }
@@ -851,7 +870,7 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // With locking
-        // Ok(self.raft.lock().unwrap().handle_request_vote(args))
+        // Ok(self.raft.lock().unwrap().handle_request_vote_request(args))
 
         // Without locking
         let (tx, mut rx) = channel(1);
@@ -864,7 +883,7 @@ impl RaftService for Node {
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         // With locking
-        // Ok(self.raft.lock().unwrap().handle_append_entries(args))
+        // Ok(self.raft.lock().unwrap().handle_append_entries_request(args))
 
         // Without locking
         let (tx, mut rx) = channel(1);
