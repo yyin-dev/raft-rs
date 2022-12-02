@@ -146,7 +146,7 @@ impl KvServer {
                         cid,
                         seq_num,
                         value: if is_get {
-                            Some(self.data.get(&key).cloned().unwrap_or(String::new()))
+                            Some(self.data.get(&key).cloned().unwrap_or_default())
                         } else {
                             None
                         },
