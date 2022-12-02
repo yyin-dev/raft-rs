@@ -1223,6 +1223,19 @@ fn snap_common(name: &str, disconnect: bool, reliable: bool, crash: bool) {
     cfg.end();
 }
 
+// How do 2d tests work?
+// From the paper, we know that log compaction/snapshotting requires cooperation
+// between the raft and the application.
+// Also, Node::snapshot is expected to be called by the application server when
+// it detects that the raft log exceeds the maxraftstate variable, to starts
+// the snapshot process.
+// But there is no application in 2d tests? Who will start the snapshot proces?
+//
+// Config::new_with has an argument to indicate whether snapshot should be
+// enabled. If so, a snapshot will be taken every time SNAPSHOT_INTERVAL logs
+// have been committed. The start1_ex function will call Node::snapshot
+// to start the snapshot process.
+
 #[test]
 fn test_snapshot_basic_2d() {
     snap_common("Test (2D): snapshots basic", false, true, false);

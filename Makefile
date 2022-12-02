@@ -5,8 +5,8 @@ export RUST_BACKTRACE=1
 LOG_LEVEL ?= raft::kvraft=info,raft::kvraft::client=info,raft::kvraft::test=debug,raft::kvraft::config=debug,raft::raft=warn,percolator=info
 
 check:
-	# cargo fmt --all -- --check
-	# cargo clippy --all --tests -- -D clippy::all -A clippy::derive_partial_eq_without_eq
+	cargo fmt --all -- --check
+	cargo clippy --all --tests -- -D clippy::all -A clippy::derive_partial_eq_without_eq
 
 test: test_others test_2 test_3
 
@@ -26,7 +26,7 @@ test_3a: cargo_test_3a
 
 test_3b: cargo_test_3b
 
-cargo_test_%: check
+cargo_test_%: 
 	RUST_BACKTRACE=full RUST_LOG=${LOG_LEVEL} cargo test -p raft -- --nocapture --test $*
 
 test_others: check

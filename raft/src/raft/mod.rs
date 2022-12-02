@@ -1,16 +1,12 @@
+use crate::raft::states::Log;
+pub use crate::raft::states::{entries_to_str, PersistentState, State};
 use futures::channel::mpsc::{channel, unbounded, Sender, UnboundedReceiver, UnboundedSender};
 use futures::executor::ThreadPool;
 use futures::task::SpawnExt;
 use futures::{select, FutureExt, StreamExt};
-use log::info;
 use rand::Rng;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-// To print commands in a readable way for debugging
-pub mod config;
-pub mod errors;
-pub mod persister;
 
 impl std::fmt::Display for Entry {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -19,15 +15,13 @@ impl std::fmt::Display for Entry {
     }
 }
 
-fn entries_to_str(entries: &Vec<Entry>) -> String {
-    let v: Vec<_> = entries.iter().map(|e| e.to_string()).collect();
-    format!("len={}, {}", entries.len(), v.join(", "))
-}
+// Note: #cfg[(test)] only applies to one line below.
+// #[cfg(test)] // To print commands in a readable way for debugging
+pub mod config;
 
-// #[cfg(test)]
-// pub mod config;
-// pub mod errors;
-// pub mod persister;
+pub mod errors;
+pub mod persister;
+pub mod states;
 
 #[cfg(test)]
 mod tests;
@@ -62,24 +56,6 @@ pub enum ApplyMsg {
     },
 }
 
-/// State of a raft peer.
-#[derive(Default, Clone, Debug)]
-pub struct State {
-    pub term: u64,
-    pub is_leader: bool,
-}
-
-impl State {
-    /// The current term of this peer.
-    pub fn term(&self) -> u64 {
-        self.term
-    }
-    /// Whether this peer believes it is the leader.
-    pub fn is_leader(&self) -> bool {
-        self.is_leader
-    }
-}
-
 #[derive(PartialEq, Eq, Debug)]
 enum Role {
     Follower,
@@ -111,8 +87,8 @@ pub struct Raft {
     curr_term: u64,
     // voted for in current term
     voted_for: Option<usize>,
-    // log entries
-    log: Vec<Entry>,
+    // log
+    log: Log,
     // commit index
     commit_idx: u64,
     // last applied entry index
@@ -129,16 +105,6 @@ pub struct Raft {
     event_tx: Option<UnboundedSender<Event>>,
     // apply channel
     apply_ch: UnboundedSender<ApplyMsg>,
-}
-
-#[derive(Message)]
-struct PersistentState {
-    #[prost(uint64, tag = "1")]
-    pub term: u64,
-    #[prost(uint64, optional, tag = "2")]
-    pub voted_for: Option<u64>,
-    #[prost(message, repeated, tag = "3")]
-    pub log: Vec<Entry>,
 }
 
 impl Raft {
@@ -166,11 +132,7 @@ impl Raft {
             role: Role::Follower,
             curr_term: 0,
             voted_for: None,
-            // Initialize with a dummy entry, that has been committed & applied.
-            log: vec![Entry {
-                term: 0,
-                cmd: vec![],
-            }],
+            log: Log::new(),
             commit_idx: 0,
             last_applied: 0,
             next_idx: vec![1; n],
@@ -200,7 +162,9 @@ impl Raft {
         let s = PersistentState {
             term: self.curr_term,
             voted_for: self.voted_for.map(|p| p as u64),
-            log: self.log.clone(),
+            entries: self.log.entries.clone(),
+            last_included_index: self.log.last_included_index,
+            last_included_term: self.log.last_included_term,
         };
 
         let mut buf: Vec<u8> = vec![];
@@ -230,7 +194,11 @@ impl Raft {
             Ok(s) => {
                 self.curr_term = s.term;
                 self.voted_for = s.voted_for.map(|p| p as usize);
-                self.log = s.log;
+                self.log = Log {
+                    entries: s.entries,
+                    last_included_index: s.last_included_index,
+                    last_included_term: s.last_included_term,
+                }
             }
             Err(e) => {
                 panic!("decode error: {:?}", e);
@@ -258,15 +226,11 @@ impl Raft {
             self,
             "-> leader, term={}, log: {}",
             self.curr_term,
-            entries_to_str(&self.log)
+            self.log
         );
         self.role = Role::Leader;
-        for i in 0..self.next_idx.len() {
-            self.next_idx[i] = self.log.len() as u64;
-        }
-        for i in 0..self.match_idx.len() {
-            self.match_idx[i] = 0;
-        }
+        self.next_idx = vec![self.log.len() as u64; self.next_idx.len()];
+        self.match_idx = vec![0; self.match_idx.len()];
     }
 
     fn other_peers(&self) -> impl Iterator<Item = usize> + '_ {
@@ -280,7 +244,7 @@ impl Raft {
 
     fn request_vote_arg(&self) -> RequestVoteArgs {
         let last_log_idx = self.log.len() as u64 - 1;
-        let last_log_term = self.log.get(last_log_idx as usize).unwrap().term;
+        let last_log_term = self.log.term_at(last_log_idx as usize);
 
         RequestVoteArgs {
             term: self.curr_term,
@@ -296,7 +260,7 @@ impl Raft {
             term: self.curr_term,
             leader_id: self.me as u64,
             prev_log_idx,
-            prev_log_term: self.log[prev_log_idx as usize].term,
+            prev_log_term: self.log.term_at(prev_log_idx as usize),
             entries: self.log[self.next_idx[peer] as usize..].to_vec(),
             leader_commit: self.commit_idx,
         }
@@ -399,8 +363,8 @@ impl Raft {
         let can_vote =
             self.voted_for.is_none() || self.voted_for.unwrap() as u64 == args.candidate_id;
 
-        let log_up_to_date = args.last_log_term > self.log.last().unwrap().term
-            || args.last_log_term == self.log.last().unwrap().term
+        let log_up_to_date = args.last_log_term > self.log.last_term()
+            || args.last_log_term == self.log.last_term()
                 && args.last_log_idx >= self.log.len() as u64 - 1;
 
         let vote_granted = can_vote && log_up_to_date;
@@ -462,9 +426,8 @@ impl Raft {
     }
 
     fn handle_append_entries_request(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
-        rlog!(self, "curr_term: {}, received AppendEntries from [{}], term={}, prev_log_idx: {}, prev_log_term: {}, entries: {}, curr_log: {}", 
-            self.curr_term, args.leader_id, args.term, args.prev_log_idx, args.prev_log_term, entries_to_str(&args.entries), entries_to_str(&self.log));
-
+        rlog!(self, "received AppendEntries from [{}], term={}, prev_log_idx: {}, prev_log_term: {}, entries: {}, curr_log: {}", 
+            args.leader_id, args.term, args.prev_log_idx, args.prev_log_term, entries_to_str(&args.entries), self.log);
         self.handle_term(args.term);
 
         let mut false_reply = AppendEntriesReply {
@@ -493,10 +456,10 @@ impl Raft {
             return false_reply;
         }
 
-        if self.log[args.prev_log_idx as usize].term != args.prev_log_term {
-            let conflict_term = self.log[args.prev_log_idx as usize].term;
+        if self.log.term_at(args.prev_log_idx as usize) != args.prev_log_term {
+            let conflict_term = self.log.term_at(args.prev_log_idx as usize);
             let mut conflict_idx = args.prev_log_idx as usize;
-            while conflict_idx > 0 && self.log[conflict_idx - 1].term == conflict_term {
+            while conflict_idx > 0 && self.log.term_at(conflict_idx - 1) == conflict_term {
                 conflict_idx -= 1;
             }
 
@@ -512,7 +475,7 @@ impl Raft {
         let mut conflict_idx = check_end;
         for i in args.prev_log_idx as usize + 1..check_end {
             let j = i - 1 - args.prev_log_idx as usize;
-            if self.log[i].term != args.entries[j].term {
+            if self.log.term_at(i) != args.entries[j].term {
                 conflict_idx = i;
                 break;
             }
@@ -607,7 +570,7 @@ impl Raft {
                 .filter(|p| self.match_idx[*p] >= n)
                 .count();
             if replicated_on as u64 >= self.majority()
-                && self.log[n as usize].term == self.curr_term
+                && self.log.term_at(n as usize) == self.curr_term
             {
                 self.commit_idx = n;
             }
@@ -678,10 +641,9 @@ impl Raft {
         crate::your_code_here((last_included_term, last_included_index, snapshot));
     }
 
-    fn snapshot(&mut self, index: u64, snapshot: &[u8]) {
+    fn snapshot(&mut self, index: u64, _snapshot: &[u8]) {
         // Your code here (2D).
-        rlog!(self, "Raft::snapshot");
-        crate::your_code_here((index, snapshot));
+        rlog!(self, "creating snapshot, index={}", index);
     }
 }
 
@@ -846,8 +808,12 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.cond_install_snapshot(last_included_term, last_included_index, snapshot)
-        info!("Node::cond_install_snapshot");
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
+
+        self.raft.lock().unwrap().cond_install_snapshot(
+            last_included_term,
+            last_included_index,
+            snapshot,
+        )
     }
 
     /// The service says it has created a snapshot that has all info up to and
@@ -858,8 +824,8 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.snapshot(index, snapshot)
-        info!("Node::snapshot");
-        crate::your_code_here((index, snapshot));
+
+        self.raft.lock().unwrap().snapshot(index, snapshot)
     }
 }
 
