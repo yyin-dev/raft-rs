@@ -1179,6 +1179,7 @@ fn snap_common(name: &str, disconnect: bool, reliable: bool, crash: bool) {
     let mut leader1 = cfg.check_one_leader();
 
     for i in 0..iters {
+        info!("[TEST] iter {}", i);
         let mut victim = (leader1 + 1) % servers;
         let mut sender = leader1;
         if i % 3 == 1 {
@@ -1188,10 +1189,12 @@ fn snap_common(name: &str, disconnect: bool, reliable: bool, crash: bool) {
 
         if disconnect {
             cfg.disconnect(victim);
+            info!("[TEST] [{}] disconnected", victim);
             cfg.one(random_entry(&mut random), servers - 1, true);
         }
         if crash {
             cfg.crash1(victim);
+            info!("[TEST] [{}] crashed", victim);
             cfg.one(random_entry(&mut random), servers - 1, true);
         }
         // send enough to get a snapshot
@@ -1210,6 +1213,7 @@ fn snap_common(name: &str, disconnect: bool, reliable: bool, crash: bool) {
             // reconnect a follower, who maybe behind and
             // needs to receive a snapshot to catch up.
             cfg.connect(victim);
+            info!("[TEST] [{}] reconnected", victim);
             cfg.one(random_entry(&mut random), servers, true);
             leader1 = cfg.check_one_leader();
         }

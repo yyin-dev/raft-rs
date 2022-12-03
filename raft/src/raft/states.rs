@@ -115,15 +115,38 @@ impl Log {
             .truncate(idx - self.last_included_index as usize - 1)
     }
 
-    // discard entries up to `index`, inclusive
-    // `index` is logical index
-    pub fn discard(&mut self, index: usize) {
-        let physical_index = index - self.last_included_index as usize - 1;
+    // compact entries up to `index`, inclusive
+    // `index` is logical index.
+    // `last_included_term` is set using existing entries in the log.
+    // Call this when the snapshot is created by the raft instance itself
+    pub fn compact(&mut self, index: usize) {
+        match (index as u64)
+            .partial_cmp(&self.last_included_index)
+            .unwrap()
+        {
+            std::cmp::Ordering::Less => {
+                panic!(
+                    "compact index={}, last_included_index={}",
+                    index, self.last_included_index
+                );
+            }
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Greater => {
+                let physical_index = index - self.last_included_index as usize - 1;
 
-        self.last_included_term = self.term_at(index);
-        self.last_included_index = index as u64;
+                self.last_included_term = self.term_at(index);
+                self.last_included_index = index as u64;
 
-        self.entries.drain(..=physical_index);
+                self.entries.drain(..=physical_index);
+            }
+        }
+    }
+
+    // the same as `compact`, except setting last_included_term using argument
+    // Call this when the snapshot is created by other raft instance(s)
+    pub fn compact_with_snapshot(&mut self, last_included_index: u64, last_included_term: u64) {
+        self.compact(last_included_index as usize);
+        self.last_included_term = last_included_term;
     }
 }
 

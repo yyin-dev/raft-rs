@@ -744,18 +744,25 @@ impl Raft {
         );
 
         if last_included_index < self.log.len() as u64 {
-            if last_included_index <= self.log.last_included_index() {
-                // Not covered in paper: A stale snapshot
+            if last_included_index < self.log.last_included_index() {
+                // A stale snapshot
                 rlog!(
                     self,
-                    "A stale snapshot? last_included_index={}, self.log.last_included_index={}",
+                    "A stale snapshot? last_included_index={} < self.log.last_included_index={}",
                     last_included_index,
                     self.log.last_included_index()
                 );
                 false
             } else {
                 // Snapshot describes a prefix
-                self.log.discard(last_included_index as usize);
+
+                // It's possible that
+                // `self.log.last_included_index() == last_included_index` but
+                // `self.log.last_included_term() != last_included_term`. So
+                // we use `compact_with_snapshot`, instead of `compact`.
+                self.log
+                    .compact_with_snapshot(last_included_index, last_included_term);
+
                 self.commit_idx = std::cmp::max(self.commit_idx, last_included_index);
                 self.last_applied = std::cmp::max(self.last_applied, last_included_index);
                 self.persist(Some(snapshot));
@@ -763,6 +770,7 @@ impl Raft {
             }
         } else {
             self.log = Log::new_from_entries(vec![], last_included_index, last_included_term);
+
             self.commit_idx = last_included_index;
             self.last_applied = last_included_index;
             self.persist(Some(snapshot));
@@ -775,8 +783,12 @@ impl Raft {
 
         assert!(self.commit_idx >= index && self.last_applied >= index);
 
-        self.log.discard(index as usize);
+        self.log.compact(index as usize);
         self.persist(Some(snapshot));
+    }
+
+    fn state_size(&self) -> usize {
+        self.persister.raft_state().len()
     }
 
     rpc!(
@@ -954,6 +966,10 @@ impl Node {
     /// possible.
     pub fn snapshot(&self, index: u64, snapshot: &[u8]) {
         self.raft.lock().unwrap().snapshot(index, snapshot)
+    }
+
+    pub fn state_size(&self) -> usize {
+        self.raft.lock().unwrap().state_size()
     }
 }
 
