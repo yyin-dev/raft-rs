@@ -45,3 +45,4 @@ Temporary Items
 # Added by me
 *.pdf
 **.log
+.idea/

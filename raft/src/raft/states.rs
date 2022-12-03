@@ -31,11 +31,11 @@ pub fn entries_to_str(entries: &Vec<Entry>) -> String {
 #[derive(Message, Clone)]
 pub struct Log {
     #[prost(message, repeated, tag = "1")]
-    pub entries: Vec<Entry>,
+    entries: Vec<Entry>,
     #[prost(uint64, tag = "2")]
-    pub last_included_index: u64,
+    last_included_index: u64,
     #[prost(uint64, tag = "3")]
-    pub last_included_term: u64,
+    last_included_term: u64,
 }
 
 impl Log {
@@ -45,6 +45,30 @@ impl Log {
             last_included_index: 0,
             last_included_term: 0,
         }
+    }
+
+    pub fn new_from_entries(
+        entries: Vec<Entry>,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> Self {
+        Self {
+            entries,
+            last_included_index,
+            last_included_term,
+        }
+    }
+
+    pub fn entries(&self) -> &Vec<Entry> {
+        &self.entries
+    }
+
+    pub fn last_included_index(&self) -> u64 {
+        self.last_included_index
+    }
+
+    pub fn last_included_term(&self) -> u64 {
+        self.last_included_term
     }
 
     pub fn physical_len(&self) -> usize {
@@ -57,38 +81,49 @@ impl Log {
         included_len + self.entries.len()
     }
 
+    // returns if the log is empty, logically
     pub fn is_empty(&self) -> bool {
-        return self.len() == 0;
+        self.len() == 0
     }
 
+    // return term of the last log entry
     pub fn last_term(&self) -> u64 {
-        if self.entries.is_empty() {
-            self.last_included_term
-        } else {
-            self.entries.last().unwrap().term
-        }
+        self.term_at(self.len() - 1)
     }
 
-    pub fn append(&mut self, xs: &mut Vec<Entry>) {
-        self.entries.append(xs)
-    }
-
-    // idx: logical index
-    pub fn truncate(&mut self, idx: usize) {
-        self.entries
-            .truncate(idx - self.last_included_index as usize - 1)
-    }
-
-    pub fn push(&mut self, e: Entry) {
-        self.entries.push(e)
-    }
-
+    // return term of entry at `idx`
     pub fn term_at(&self, idx: usize) -> u64 {
         if idx == self.last_included_index as usize {
             self.last_included_term
         } else {
             self[idx].term
         }
+    }
+
+    pub fn push(&mut self, e: Entry) {
+        self.entries.push(e)
+    }
+
+    pub fn append(&mut self, xs: &mut Vec<Entry>) {
+        self.entries.append(xs)
+    }
+
+    // truncate the log starting at `idx`, including `idx`
+    // idx: logical index
+    pub fn truncate(&mut self, idx: usize) {
+        self.entries
+            .truncate(idx - self.last_included_index as usize - 1)
+    }
+
+    // discard entries up to `index`, inclusive
+    // `index` is logical index
+    pub fn discard(&mut self, index: usize) {
+        let physical_index = index - self.last_included_index as usize - 1;
+
+        self.last_included_term = self.term_at(index);
+        self.last_included_index = index as u64;
+
+        self.entries.drain(..=physical_index);
     }
 }
 
@@ -141,6 +176,8 @@ pub struct PersistentState {
     pub term: u64,
     #[prost(uint64, optional, tag = "2")]
     pub voted_for: Option<u64>,
+    // I cannot find a way to add `Log` as a field directly.
+    // So I put fields separately here.
     #[prost(message, repeated, tag = "3")]
     pub entries: Vec<Entry>,
     #[prost(uint64, tag = "4")]

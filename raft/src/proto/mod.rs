@@ -5,6 +5,7 @@ pub mod raftpb {
         service raft {
             rpc request_vote(RequestVoteArgs) returns (RequestVoteReply);
             rpc append_entries(AppendEntriesArgs) returns (AppendEntriesReply);
+            rpc install_snapshot(InstallSnapshotArgs) returns (InstallSnapshotReply);
         }
     }
     pub use self::raft::{

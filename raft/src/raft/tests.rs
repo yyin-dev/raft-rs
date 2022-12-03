@@ -1235,6 +1235,12 @@ fn snap_common(name: &str, disconnect: bool, reliable: bool, crash: bool) {
 // enabled. If so, a snapshot will be taken every time SNAPSHOT_INTERVAL logs
 // have been committed. The start1_ex function will call Node::snapshot
 // to start the snapshot process.
+//
+// Note that when a raft instance accepts a snapshot (either created by itself
+// or from another raft instance), you must send on the the apply channel (this
+// is the way to let the testing code know that a snapshot is accepted). The
+// testing code will call cond_install_snapshot, which means "conditionally
+// install a snapshot".
 
 #[test]
 fn test_snapshot_basic_2d() {

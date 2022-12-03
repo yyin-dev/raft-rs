@@ -75,7 +75,7 @@ impl KvServer {
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
 
-        let server = KvServer {
+        KvServer {
             rf: raft::Node::new(rf),
             me,
             maxraftstate,
@@ -83,9 +83,7 @@ impl KvServer {
             latest_seq_nums: HashMap::new(),
             apply_ch: Some(apply_ch),
             started_cmds: HashMap::new(),
-        };
-
-        server
+        }
     }
 
     fn is_duplicate(&mut self, cid: &str, seq_num: u64) -> bool {
