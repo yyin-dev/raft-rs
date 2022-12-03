@@ -72,7 +72,7 @@ enum Event {
     AppendEntriesArgs((AppendEntriesArgs, Sender<AppendEntriesReply>)),
     AppendEntriesReplyMsg((usize, AppendEntriesReply, AppendEntriesArgs)),
     InstallSnapshotArgs((InstallSnapshotArgs, Sender<InstallSnapshotReply>)),
-    InstallSnapshotReply((usize, InstallSnapshotReply, InstallSnapshotArgs)),
+    InstallSnapshotReplyMsg((usize, InstallSnapshotReply, InstallSnapshotArgs)),
 }
 
 // A single Raft peer.
@@ -107,6 +107,38 @@ pub struct Raft {
     event_tx: Option<UnboundedSender<Event>>,
     // apply channel
     apply_ch: UnboundedSender<ApplyMsg>,
+}
+
+/// The labrpc package simulates a lossy network, in which servers
+/// may be unreachable, and in which requests and replies may be lost.
+/// This method sends a request and waits for a reply. If a reply arrives
+/// within a timeout interval, This method returns Ok(_); otherwise
+/// this method returns Err(_). Thus this method may not return for a while.
+/// An Err(_) return can be caused by a dead server, a live server that
+/// can't be reached, a lost request, or a lost reply.
+///
+/// This method is guaranteed to return (perhaps after a delay) *except* if
+/// the handler function on the server side does not return.  Thus there
+/// is no need to implement your own timeouts around this method.
+///
+/// look at the comments in ../labrpc/src/lib.rs for more details.
+macro_rules! rpc {
+    ($func_name: ident, $rpc_name: ident, $arg: ty, $reply_msg: path) => {
+        fn $func_name(&self, server: usize, args: $arg) {
+            let peer = &self.peers[server];
+            let peer_clone = peer.clone();
+
+            let event_tx = self.event_tx.as_ref().unwrap().clone();
+            peer.spawn(async move {
+                let res = peer_clone.$rpc_name(&args).await.map_err(Error::Rpc);
+                if let Ok(reply) = res {
+                    event_tx
+                        .unbounded_send(($reply_msg((server, reply, args))))
+                        .unwrap();
+                }
+            });
+        }
+    };
 }
 
 impl Raft {
@@ -313,64 +345,6 @@ impl Raft {
             Some(args) => self.send_append_entries(p, args),
             None => self.send_install_snapshot(p, self.install_snapshot_arg()),
         }
-    }
-
-    /// The labrpc package simulates a lossy network, in which servers
-    /// may be unreachable, and in which requests and replies may be lost.
-    /// This method sends a request and waits for a reply. If a reply arrives
-    /// within a timeout interval, This method returns Ok(_); otherwise
-    /// this method returns Err(_). Thus this method may not return for a while.
-    /// An Err(_) return can be caused by a dead server, a live server that
-    /// can't be reached, a lost request, or a lost reply.
-    ///
-    /// This method is guaranteed to return (perhaps after a delay) *except* if
-    /// the handler function on the server side does not return.  Thus there
-    /// is no need to implement your own timeouts around this method.
-    ///
-    /// look at the comments in ../labrpc/src/lib.rs for more details.
-    fn send_request_vote(&self, server: usize, args: RequestVoteArgs) {
-        let peer = &self.peers[server];
-        let peer_clone = peer.clone();
-
-        let event_tx = self.event_tx.as_ref().unwrap().clone();
-        peer.spawn(async move {
-            let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-            if let Ok(reply) = res {
-                event_tx
-                    .unbounded_send(Event::RequestVoteReplyMsg((server, reply, args)))
-                    .unwrap();
-            }
-        });
-    }
-
-    fn send_append_entries(&self, server: usize, args: AppendEntriesArgs) {
-        let peer = &self.peers[server];
-        let peer_clone = peer.clone();
-
-        let event_tx = self.event_tx.as_ref().unwrap().clone();
-        peer.spawn(async move {
-            let res = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
-            if let Ok(reply) = res {
-                event_tx
-                    .unbounded_send(Event::AppendEntriesReplyMsg((server, reply, args)))
-                    .unwrap();
-            }
-        });
-    }
-
-    fn send_install_snapshot(&self, server: usize, args: InstallSnapshotArgs) {
-        let peer = &self.peers[server];
-        let peer_clone = peer.clone();
-
-        let event_tx = self.event_tx.as_ref().unwrap().clone();
-        peer.spawn(async move {
-            let res = peer_clone.install_snapshot(&args).await.map_err(Error::Rpc);
-            if let Ok(reply) = res {
-                event_tx
-                    .unbounded_send(Event::InstallSnapshotReply((server, reply, args)))
-                    .unwrap();
-            }
-        });
     }
 
     fn apply_committed(&mut self) {
@@ -727,7 +701,7 @@ impl Raft {
                 tx.try_send(self.handle_install_snapshot_request(args))
                     .unwrap();
             }
-            Event::InstallSnapshotReply((from, reply, args)) => {
+            Event::InstallSnapshotReplyMsg((from, reply, args)) => {
                 self.handle_install_snapshot_reply(from, reply, args)
             }
         }
@@ -804,6 +778,27 @@ impl Raft {
         self.log.discard(index as usize);
         self.persist(Some(snapshot));
     }
+
+    rpc!(
+        send_request_vote,
+        request_vote,
+        RequestVoteArgs,
+        Event::RequestVoteReplyMsg
+    );
+
+    rpc!(
+        send_append_entries,
+        append_entries,
+        AppendEntriesArgs,
+        Event::AppendEntriesReplyMsg
+    );
+
+    rpc!(
+        send_install_snapshot,
+        install_snapshot,
+        InstallSnapshotArgs,
+        Event::InstallSnapshotReplyMsg
+    );
 }
 
 // Choose concurrency paradigm.
