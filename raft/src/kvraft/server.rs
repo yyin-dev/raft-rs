@@ -99,9 +99,9 @@ impl KvServer {
             self.latest_seq_nums.insert(cid.to_string(), 0);
         }
 
-        assert!(*self.latest_seq_nums.get(cid).unwrap() <= seq_num);
-
-        self.latest_seq_nums.insert(cid.to_string(), seq_num);
+        if *self.latest_seq_nums.get(cid).unwrap() < seq_num {
+            self.latest_seq_nums.insert(cid.to_string(), seq_num);
+        }
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -127,35 +127,21 @@ impl KvServer {
         };
     }
 
-    fn apply(&mut self, apply_msg: raft::ApplyMsg) {
+    // Apply an ApplyMsg
+    fn apply_msg(&mut self, apply_msg: raft::ApplyMsg) -> AppliedCmd {
         match apply_msg {
-            ApplyMsg::Command { data, index } => {
-                let (cid, seq_num, key, is_get) =
-                    if let Ok(req) = labcodec::decode::<GetRequest>(&data) {
-                        (req.cid, req.seq_num, req.key, true)
-                    } else if let Ok(req) = labcodec::decode::<PutAppendRequest>(&data) {
-                        (req.cid, req.seq_num, req.key, false)
-                    } else {
-                        panic!("decode error");
-                    };
+            ApplyMsg::Command { data, index: _ } => {
+                let (cid, seq_num) = if let Ok(req) = labcodec::decode::<GetRequest>(&data) {
+                    (req.cid, req.seq_num)
+                } else if let Ok(req) = labcodec::decode::<PutAppendRequest>(&data) {
+                    (req.cid, req.seq_num)
+                } else {
+                    panic!("decode error");
+                };
 
-                if self.is_duplicate(&cid, seq_num) {
-                    let applied_cmd = AppliedCmd {
-                        cid,
-                        seq_num,
-                        value: if is_get {
-                            Some(self.data.get(&key).cloned().unwrap_or_default())
-                        } else {
-                            None
-                        },
-                    };
-                    self.started_cmds
-                        .remove(&index)
-                        .map(|mut tx| tx.try_send(Ok(applied_cmd)));
-                    return;
-                }
-
-                let applied_cmd = if let Ok(get_request) = labcodec::decode::<GetRequest>(&data) {
+                if let Ok(get_request) = labcodec::decode::<GetRequest>(&data) {
+                    // For read, always read latest (even if duplicate)
+                    // This still satisfies linearizability
                     info!("[{}] applies {}", self.me, get_request);
                     let value = match self.data.get(&get_request.key) {
                         None => String::new(),
@@ -168,28 +154,31 @@ impl KvServer {
                         value: Some(value),
                     }
                 } else if let Ok(put_append_request) = labcodec::decode::<PutAppendRequest>(&data) {
-                    info!("[{}] applies {}", self.me, put_append_request);
-                    match put_append_request.op {
-                        0 => panic!("unknown op?"),
-                        1 => {
-                            /* put */
-                            self.data.insert(
-                                put_append_request.key.clone(),
-                                put_append_request.value.clone(),
-                            );
-                        }
-                        2 => {
-                            /* append */
-                            // Caveat: if there's no existing record, append should still happen!
-                            // If you ignore append when there's no record, you will pass all
-                            // tests except the linearizability. Super confusing!
-                            self.data
-                                .entry(put_append_request.key.clone())
-                                .or_default()
-                                .push_str(&put_append_request.value);
-                        }
-                        op => panic!("unexpected op: {}", op),
-                    };
+                    // For write, duplicates are ignored
+                    if !self.is_duplicate(&cid, seq_num) {
+                        info!("[{}] applies {}", self.me, put_append_request);
+                        match put_append_request.op {
+                            0 => panic!("unknown op?"),
+                            1 => {
+                                /* put */
+                                self.data.insert(
+                                    put_append_request.key.clone(),
+                                    put_append_request.value.clone(),
+                                );
+                            }
+                            2 => {
+                                /* append */
+                                // Caveat: if there's no existing record, append should still happen!
+                                // If you ignore append when there's no record, you will pass all
+                                // tests except the linearizability. Super confusing!
+                                self.data
+                                    .entry(put_append_request.key.clone())
+                                    .or_default()
+                                    .push_str(&put_append_request.value);
+                            }
+                            op => panic!("unexpected op: {}", op),
+                        };
+                    }
 
                     AppliedCmd {
                         cid: put_append_request.cid,
@@ -198,9 +187,17 @@ impl KvServer {
                     }
                 } else {
                     panic!("decode error");
-                };
+                }
+            }
+            ApplyMsg::Snapshot { .. } => unreachable!(),
+        }
+    }
 
-                self.record_seen_seq_num(&cid, seq_num);
+    fn apply(&mut self, apply_msg: raft::ApplyMsg) {
+        match apply_msg {
+            ApplyMsg::Command { data: _, index } => {
+                let applied_cmd = self.apply_msg(apply_msg);
+                self.record_seen_seq_num(&applied_cmd.cid, applied_cmd.seq_num);
 
                 self.started_cmds
                     .remove(&index)
@@ -211,16 +208,7 @@ impl KvServer {
                 term: _,
                 index: _,
             } => todo!(),
-        }
-    }
-}
-
-impl KvServer {
-    /// Only for suppressing deadcode warnings.
-    #[doc(hidden)]
-    pub fn __suppress_deadcode(&mut self) {
-        let _ = &self.me;
-        let _ = &self.maxraftstate;
+        };
     }
 }
 
