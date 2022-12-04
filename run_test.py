@@ -9,7 +9,7 @@ if __name__ == "__main__":
 
         # with log
         file_name = "./logs/test" + str(i) + ".log"
-        os.system(f"make cargo_test_test_snapshot_install_2d >{file_name} 2>&1")
+        os.system(f"make cargo_test_3b 2>{file_name} 1>&2")
 
         with open(file_name) as f:
             if 'FAILED' in f.read():

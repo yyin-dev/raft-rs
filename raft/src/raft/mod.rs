@@ -330,7 +330,6 @@ impl Raft {
 
         // send RequestVote to others in parallel
         for p in self.other_peers() {
-            rlog!(self, "send RequestVote to [{}]", p);
             self.send_request_vote(p, self.request_vote_arg());
         }
     }
@@ -470,13 +469,29 @@ impl Raft {
         // (Simplified) fast rollback using only conflict_index
         // Described in https://thesquareplanet.com/blog/students-guide-to-raft/
 
+        //
+        //                          CaseA       CaseB                 CaseC
+        // args.last_included_index  ↓           ↓                     ↓
+        //                                 □ □ □ □ □ □ □ □ □ □ □ □ □
+        //                               ↑
+        //                 self.log.last_included_index
+        // CaseA is a match.
+        // CaseB can be a match or a mismatch.
+        // CaseC is a mismatch.
+        //
+        // CaseA is only possible after implementing snapshot.
+
         // Reply false if the log doesn't match at prevLogIndex
+        // CaseC
         if self.log.len() <= args.prev_log_idx as usize {
             false_reply.conflict_idx = self.log.len() as u64;
             return false_reply;
         }
 
-        if self.log.term_at(args.prev_log_idx as usize) != args.prev_log_term {
+        // CaseB-mismatch
+        if args.prev_log_idx >= self.log.last_included_index()
+            && self.log.term_at(args.prev_log_idx as usize) != args.prev_log_term
+        {
             let conflict_term = self.log.term_at(args.prev_log_idx as usize);
             let mut conflict_idx = args.prev_log_idx as usize;
             while conflict_idx > self.log.last_included_index() as usize
@@ -489,13 +504,16 @@ impl Raft {
             return false_reply;
         }
 
+        // CaseA + CaseB-match
         // Find conflict
+        let check_start =
+            std::cmp::max(self.log.last_included_index(), args.prev_log_idx + 1) as usize;
         let check_end = std::cmp::min(
             self.log.len(),
             args.prev_log_idx as usize + 1 + args.entries.len(),
         );
         let mut conflict_idx = check_end;
-        for i in args.prev_log_idx as usize + 1..check_end {
+        for i in check_start..check_end {
             let j = i - 1 - args.prev_log_idx as usize;
             if self.log.term_at(i) != args.entries[j].term {
                 conflict_idx = i;
@@ -742,6 +760,14 @@ impl Raft {
             last_included_index,
             last_included_term
         );
+
+        // Must reject this snapshot!
+        // This is not mentioned in the paper/writeup!
+        // Otherwise, the application will install this OLD snapshot and
+        // loses commands that were applied after this snapshot was taken!
+        if last_included_index <= self.last_applied {
+            return false;
+        }
 
         if last_included_index < self.log.len() as u64 {
             if last_included_index < self.log.last_included_index() {

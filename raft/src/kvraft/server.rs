@@ -2,11 +2,22 @@ use futures::channel::mpsc::{channel, unbounded, Sender, UnboundedReceiver, Unbo
 use futures::executor::ThreadPool;
 use futures::task::SpawnExt;
 use futures::{select, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::proto::kvraftpb::*;
 use crate::raft::{self, ApplyMsg};
+
+/// Macro for logging message combined with state of the Raft peer.
+macro_rules! slog {
+    (level: $level:ident, $server:expr, $($arg:tt)+) => {
+        ::log::$level!("<{}> {}", $server.me, format_args!($($arg)+))
+    };
+    ($raft:expr, $($arg:tt)+) => {
+        slog!(level: info, $raft, $($arg)+)
+    };
+}
 
 struct AppliedCmd {
     cid: String,
@@ -53,6 +64,18 @@ impl std::fmt::Display for PutAppendRequest {
     }
 }
 
+// Paper says snapshot = application date + last included index & term.
+// SnapshotState only stores application data: data + latest_seq_num.
+// last included index & term are stored in server log (see `Log` struct). 
+// Whenever a snapshot is taken, last included index & term are always persisted 
+// together (see Raft::persist function). So this is essentially the same as 
+// what the paper describes.
+#[derive(Serialize, Deserialize, Default)]
+struct SnapshotState {
+    data: HashMap<String, String>,
+    latest_seq_nums: HashMap<String, u64>,
+}
+
 pub struct KvServer {
     pub rf: raft::Node,
     pub me: usize,
@@ -60,9 +83,11 @@ pub struct KvServer {
     maxraftstate: Option<usize>,
 
     data: HashMap<String, String>,
-    latest_seq_nums: HashMap<String, u64>,
     apply_ch: Option<UnboundedReceiver<ApplyMsg>>,
     started_cmds: HashMap<u64, OpResultTx>,
+
+    // for duplicate detection
+    latest_seq_nums: HashMap<String, u64>,
 }
 
 impl KvServer {
@@ -73,14 +98,20 @@ impl KvServer {
         maxraftstate: Option<usize>,
     ) -> KvServer {
         let (tx, apply_ch) = unbounded();
+
+        // Restore snapshot at start time
+        let snapshot_state: SnapshotState =
+            serde_json::from_str(std::str::from_utf8(&persister.snapshot()).unwrap())
+                .unwrap_or_default();
+
         let rf = raft::Raft::new(servers, me, persister, tx);
 
         KvServer {
             rf: raft::Node::new(rf),
             me,
             maxraftstate,
-            data: HashMap::new(),
-            latest_seq_nums: HashMap::new(),
+            data: snapshot_state.data,
+            latest_seq_nums: snapshot_state.latest_seq_nums,
             apply_ch: Some(apply_ch),
             started_cmds: HashMap::new(),
         }
@@ -108,7 +139,7 @@ impl KvServer {
         match event {
             Event::Get((arg, mut tx)) => match self.rf.start(&arg) {
                 Ok((idx, _)) => {
-                    info!("[{}] starts {}", self.me, arg);
+                    slog!(self, "starts {}", arg);
                     self.started_cmds.insert(idx, tx);
                 }
                 Err(_) => {
@@ -117,7 +148,7 @@ impl KvServer {
             },
             Event::PutAppend((arg, mut tx)) => match self.rf.start(&arg) {
                 Ok((idx, _)) => {
-                    info!("[{}] starts {}", self.me, arg);
+                    slog!(self, "starts {}", arg);
                     self.started_cmds.insert(idx, tx);
                 }
                 Err(_) => {
@@ -142,7 +173,7 @@ impl KvServer {
                 if let Ok(get_request) = labcodec::decode::<GetRequest>(&data) {
                     // For read, always read latest (even if duplicate)
                     // This still satisfies linearizability
-                    info!("[{}] applies {}", self.me, get_request);
+                    slog!(self, "applies {}", get_request);
                     let value = match self.data.get(&get_request.key) {
                         None => String::new(),
                         Some(v) => v.clone(),
@@ -156,7 +187,6 @@ impl KvServer {
                 } else if let Ok(put_append_request) = labcodec::decode::<PutAppendRequest>(&data) {
                     // For write, duplicates are ignored
                     if !self.is_duplicate(&cid, seq_num) {
-                        info!("[{}] applies {}", self.me, put_append_request);
                         match put_append_request.op {
                             0 => panic!("unknown op?"),
                             1 => {
@@ -164,6 +194,13 @@ impl KvServer {
                                 self.data.insert(
                                     put_append_request.key.clone(),
                                     put_append_request.value.clone(),
+                                );
+
+                                slog!(
+                                    self,
+                                    "applies {}, res={}",
+                                    put_append_request,
+                                    self.data.get(&put_append_request.key).unwrap()
                                 );
                             }
                             2 => {
@@ -175,6 +212,13 @@ impl KvServer {
                                     .entry(put_append_request.key.clone())
                                     .or_default()
                                     .push_str(&put_append_request.value);
+
+                                slog!(
+                                    self,
+                                    "applies {}, res={}",
+                                    put_append_request,
+                                    self.data.get(&put_append_request.key).unwrap()
+                                );
                             }
                             op => panic!("unexpected op: {}", op),
                         };
@@ -202,12 +246,46 @@ impl KvServer {
                 self.started_cmds
                     .remove(&index)
                     .map(|mut tx| tx.try_send(Ok(applied_cmd)));
+
+                // May take a snapshot
+                if let Some(maxraftstate) = self.maxraftstate {
+                    if self.rf.state_size() > maxraftstate {
+                        slog!(
+                            self,
+                            "starts taking snapshot! data={:?}, latest_seq_num={:?}",
+                            self.data,
+                            self.latest_seq_nums
+                        );
+
+                        let state = SnapshotState {
+                            data: self.data.clone(),
+                            latest_seq_nums: self.latest_seq_nums.clone(),
+                        };
+
+                        let snapshot = serde_json::to_string(&state).unwrap();
+                        self.rf.snapshot(index, snapshot.as_bytes());
+                    }
+                }
             }
-            ApplyMsg::Snapshot {
-                data: _,
-                term: _,
-                index: _,
-            } => todo!(),
+            ApplyMsg::Snapshot { data, term, index } => {
+                // take snapshot only if cond_install_snapshot succeeds
+                if self.rf.cond_install_snapshot(term, index, &data) {
+                    let state: SnapshotState =
+                        serde_json::from_str(std::str::from_utf8(&data).unwrap()).unwrap();
+
+                    slog!(
+                        self,
+                        "cond_install_snapshot(index={}, term={}) succeeds. data={:?}, latest_seq_num:{:?}",
+                        index,
+                        term,
+                        state.data,
+                        state.latest_seq_nums
+                    );
+
+                    self.data = state.data;
+                    self.latest_seq_nums = state.latest_seq_nums;
+                }
+            }
         };
     }
 }
@@ -306,69 +384,83 @@ impl Node {
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
-        info!("[{}] receives {}", self.me, arg);
+        slog!(self, "receives {}", arg);
 
         let (tx, mut rx) = channel(1);
         self.event_tx
             .unbounded_send(Event::Get((arg.clone(), tx)))
             .unwrap();
-        let res = match rx.next().await.unwrap() {
-            Ok(applied_cmd) => {
-                if applied_cmd.cid == arg.cid && applied_cmd.seq_num == arg.seq_num {
-                    Ok(GetReply {
-                        wrong_leader: false,
-                        err: String::new(),
-                        value: applied_cmd.value.unwrap(),
-                    })
-                } else {
-                    Ok(GetReply {
-                        wrong_leader: true,
-                        err: String::from("not committed"),
-                        value: String::new(),
-                    })
-                }
-            }
-            Err(ServerError::WrongLeader) => Ok(GetReply {
+
+        let res = match rx.next().await {
+            None => Ok(GetReply {
                 wrong_leader: true,
-                err: String::new(),
+                err: String::from("not committed"),
                 value: String::new(),
             }),
+            Some(res) => match res {
+                Ok(applied_cmd) => {
+                    if applied_cmd.cid == arg.cid && applied_cmd.seq_num == arg.seq_num {
+                        Ok(GetReply {
+                            wrong_leader: false,
+                            err: String::new(),
+                            value: applied_cmd.value.unwrap(),
+                        })
+                    } else {
+                        Ok(GetReply {
+                            wrong_leader: true,
+                            err: String::from("not committed"),
+                            value: String::new(),
+                        })
+                    }
+                }
+                Err(ServerError::WrongLeader) => Ok(GetReply {
+                    wrong_leader: true,
+                    err: String::new(),
+                    value: String::new(),
+                }),
+            },
         };
 
-        info!("[{}] {} -> {:?}", self.me, arg, res);
+        slog!(self, "{} -> {:?}", arg, res);
         res
     }
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn put_append(&self, arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
-        info!("[{}] receives {}", self.me, arg);
+        slog!(self, "receives {}", arg);
 
         let (tx, mut rx) = channel(1);
         self.event_tx
             .unbounded_send(Event::PutAppend((arg.clone(), tx)))
             .unwrap();
 
-        let res = match rx.next().await.unwrap() {
-            Ok(applied_cmd) => {
-                if applied_cmd.cid == arg.cid && applied_cmd.seq_num == arg.seq_num {
-                    Ok(PutAppendReply {
-                        wrong_leader: false,
-                        err: String::new(),
-                    })
-                } else {
-                    Ok(PutAppendReply {
-                        wrong_leader: true,
-                        err: String::from("not committed"),
-                    })
-                }
-            }
-            Err(ServerError::WrongLeader) => Ok(PutAppendReply {
+        let res = match rx.next().await {
+            None => Ok(PutAppendReply {
                 wrong_leader: true,
-                err: String::new(),
+                err: String::from("not committed"),
             }),
+            Some(res) => match res {
+                Ok(applied_cmd) => {
+                    if applied_cmd.cid == arg.cid && applied_cmd.seq_num == arg.seq_num {
+                        Ok(PutAppendReply {
+                            wrong_leader: false,
+                            err: String::new(),
+                        })
+                    } else {
+                        Ok(PutAppendReply {
+                            wrong_leader: true,
+                            err: String::from("not committed"),
+                        })
+                    }
+                }
+                Err(ServerError::WrongLeader) => Ok(PutAppendReply {
+                    wrong_leader: true,
+                    err: String::new(),
+                }),
+            },
         };
 
-        info!("[{}] {} -> {:?}", self.me, arg, res);
+        slog!(self, "{} -> {:?}", arg, res);
 
         res
     }

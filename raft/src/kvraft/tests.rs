@@ -235,7 +235,7 @@ fn generic_test(
     }
     for i in 0..3 {
         let (partitioner_tx, partitioner_rx) = mpsc::channel();
-        debug!("Iteration {}", i);
+        debug!("[TEST] Iteration {}", i);
         done_clients.store(0, Ordering::Relaxed);
         done_partitioner.store(0, Ordering::Relaxed);
         let clnt_txs_ = clnt_txs.clone();
@@ -296,7 +296,7 @@ fn generic_test(
         done_partitioner.store(1, Ordering::Relaxed);
 
         if partitions {
-            debug!("wait for partitioner");
+            debug!("[TEST] wait for partitioner");
             partitioner_rx.recv().unwrap();
             // reconnect network and submit a request. A client may
             // have submitted a request in a minority.  That request
@@ -308,14 +308,14 @@ fn generic_test(
         }
 
         if crash {
-            debug!("shutdown servers");
+            debug!("[TEST] shutdown servers");
             for i in 0..NSERVERS {
                 cfg.shutdown_server(i)
             }
             // Wait for a while for servers to shutdown, since
             // shutdown isn't a real crash and isn't instantaneous
             thread::sleep(RAFT_ELECTION_TIMEOUT);
-            debug!("restart servers");
+            debug!("[TEST] restart servers");
             // crash and re-start all
             for i in 0..NSERVERS {
                 cfg.start_server(i);
@@ -323,7 +323,7 @@ fn generic_test(
             cfg.connect_all();
         }
 
-        debug!("wait for clients");
+        debug!("[TEST] wait for clients");
         for (i, clnt_rx) in clnt_rxs.iter().enumerate() {
             debug!("read from clients {}", i);
             let j = clnt_rx.recv().unwrap();
