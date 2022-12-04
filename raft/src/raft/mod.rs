@@ -187,28 +187,18 @@ impl Raft {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self, snapshot: Option<&[u8]>) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
-
         let s = PersistentState {
             term: self.curr_term,
             voted_for: self.voted_for.map(|p| p as u64),
-            entries: self.log.entries().clone(),
-            last_included_index: self.log.last_included_index(),
-            last_included_term: self.log.last_included_term(),
+            log: self.log.clone(),
         };
 
-        let mut buf: Vec<u8> = vec![];
-        labcodec::encode(&s, &mut buf).unwrap();
+        let s = serde_json::to_vec(&s).unwrap();
 
         match snapshot {
-            None => self.persister.save_raft_state(buf),
+            None => self.persister.save_raft_state(s),
             Some(snapshot) => {
-                self.persister
-                    .save_state_and_snapshot(buf, snapshot.to_vec());
+                self.persister.save_state_and_snapshot(s, snapshot.to_vec());
             }
         }
     }
@@ -220,30 +210,12 @@ impl Raft {
             return;
         }
 
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
-        match labcodec::decode::<PersistentState>(data) {
-            Ok(s) => {
-                self.curr_term = s.term;
-                self.voted_for = s.voted_for.map(|p| p as usize);
-                self.log =
-                    Log::new_from_entries(s.entries, s.last_included_index, s.last_included_term);
-                self.last_applied = s.last_included_index;
-                self.commit_idx = s.last_included_index;
-            }
-            Err(e) => {
-                panic!("decode error: {:?}", e);
-            }
-        }
+        let s: PersistentState = serde_json::from_str(std::str::from_utf8(data).unwrap()).unwrap();
+        self.curr_term = s.term;
+        self.voted_for = s.voted_for.map(|p| p as usize);
+        self.log = s.log;
+        self.last_applied = self.log.last_included_index();
+        self.commit_idx = self.log.last_included_index();
     }
 
     fn as_follower(&mut self, new_term: u64) {

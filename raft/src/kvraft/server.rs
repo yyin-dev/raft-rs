@@ -66,9 +66,9 @@ impl std::fmt::Display for PutAppendRequest {
 
 // Paper says snapshot = application date + last included index & term.
 // SnapshotState only stores application data: data + latest_seq_num.
-// last included index & term are stored in server log (see `Log` struct). 
-// Whenever a snapshot is taken, last included index & term are always persisted 
-// together (see Raft::persist function). So this is essentially the same as 
+// last included index & term are stored in server log (see `Log` struct).
+// Whenever a snapshot is taken, last included index & term are always persisted
+// together (see Raft::persist function). So this is essentially the same as
 // what the paper describes.
 #[derive(Serialize, Deserialize, Default)]
 struct SnapshotState {

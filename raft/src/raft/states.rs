@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     fmt::Display,
     ops::{Index, RangeFrom},
@@ -28,13 +29,10 @@ pub fn entries_to_str(entries: &Vec<Entry>) -> String {
     format!("len={}, {}", entries.len(), v.join(", "))
 }
 
-#[derive(Message, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Log {
-    #[prost(message, repeated, tag = "1")]
     entries: Vec<Entry>,
-    #[prost(uint64, tag = "2")]
     last_included_index: u64,
-    #[prost(uint64, tag = "3")]
     last_included_term: u64,
 }
 
@@ -193,18 +191,9 @@ impl Display for Log {
     }
 }
 
-#[derive(Message)]
+#[derive(Serialize, Deserialize)]
 pub struct PersistentState {
-    #[prost(uint64, tag = "1")]
     pub term: u64,
-    #[prost(uint64, optional, tag = "2")]
     pub voted_for: Option<u64>,
-    // I cannot find a way to add `Log` as a field directly.
-    // So I put fields separately here.
-    #[prost(message, repeated, tag = "3")]
-    pub entries: Vec<Entry>,
-    #[prost(uint64, tag = "4")]
-    pub last_included_index: u64,
-    #[prost(uint64, tag = "5")]
-    pub last_included_term: u64,
+    pub log: Log,
 }
