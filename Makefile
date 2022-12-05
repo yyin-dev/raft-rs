@@ -32,5 +32,8 @@ cargo_test_%:
 test_others: check
 	RUST_LOG=${LOG_LEVEL} cargo test -p labrpc -p labcodec -- --nocapture
 
-test_percolator: check
-	RUST_LOG=${LOG_LEVEL} cargo test -p percolator -- --nocapture
+test_percolator:
+	RUST_BACKTRACE=full RUST_LOG=${LOG_LEVEL} cargo test -p percolator -- --nocapture
+
+test_percolator_%:
+	RUST_BACKTRACE=full RUST_LOG=${LOG_LEVEL} cargo test -p percolator -- --nocapture --test $*

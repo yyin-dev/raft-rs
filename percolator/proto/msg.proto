@@ -1,11 +1,11 @@
-// Protocol buffers are a flexible, efficient, automated mechanism for serializing structured data.
-// You can define how you want your data to be structured.
-// Details can be found in https://developers.google.com/protocol-buffers/docs/proto3.
+// Protocol buffers are a flexible, efficient, automated mechanism for
+// serializing structured data. You can define how you want your data to be
+// structured. Details can be found in
+// https://developers.google.com/protocol-buffers/docs/proto3.
 
-// Once you have defined the message, the `build.rs` will generate the corresponding data structure in `OUT_DIR`.
-// You can use the structure by importing the `msg` module.
-// Example:
-// use crate::msg::CommitRequest;
+// Once you have defined the message, the `build.rs` will generate the
+// corresponding data structure in `OUT_DIR`. You can use the structure by
+// importing the `msg` module. Example: use crate::msg::CommitRequest;
 
 syntax = "proto3";
 
@@ -13,7 +13,7 @@ package msg;
 
 message TimestampRequest {}
 
-message TimestampResponse {}
+message TimestampResponse { uint64 ts = 1; }
 
 message GetRequest {}
 
@@ -23,8 +23,6 @@ message PrewriteRequest {}
 
 message PrewriteResponse {}
 
-message CommitRequest {
-    bool is_primary = 1;
-}
+message CommitRequest { bool is_primary = 1; }
 
 message CommitResponse {}

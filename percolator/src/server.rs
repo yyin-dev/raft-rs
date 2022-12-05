@@ -6,6 +6,15 @@ use crate::msg::*;
 use crate::service::*;
 use crate::*;
 
+macro_rules! slog {
+    (level: $level:ident, $($arg:tt)+) => {
+        ::log::$level!($($arg)+)
+    };
+    ($($arg:tt)+) => {
+        slog!(level: info, $($arg)+)
+    };
+}
+
 // TTL is used for a lock key.
 // If the key's lifetime exceeds this value, it should be cleaned up.
 // Otherwise, the operation should back off.
@@ -13,15 +22,17 @@ const TTL: u64 = Duration::from_millis(100).as_nanos() as u64;
 
 #[derive(Clone, Default)]
 pub struct TimestampOracle {
-    // You definitions here if needed.
+    next_ts: Arc<Mutex<u64>>,
 }
 
 #[async_trait::async_trait]
 impl timestamp::Service for TimestampOracle {
     // example get_timestamp RPC handler.
-    async fn get_timestamp(&self, _: TimestampRequest) -> labrpc::Result<TimestampResponse> {
-        // Your code here.
-        unimplemented!()
+    async fn get_timestamp(&self, req: TimestampRequest) -> labrpc::Result<TimestampResponse> {
+        let mut next_ts = self.next_ts.lock().unwrap();
+        let resp = TimestampResponse { ts: *next_ts };
+        *next_ts = *next_ts + 1;
+        Ok(resp)
     }
 }
 
