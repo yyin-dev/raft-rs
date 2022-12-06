@@ -15,3 +15,7 @@ mod tests;
 mod msg {
     include!(concat!(env!("OUT_DIR"), "/msg.rs"));
 }
+
+pub fn u8_vec_to_str(v: &[u8]) -> &str {
+    std::str::from_utf8(v).unwrap()
+}

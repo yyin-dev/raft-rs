@@ -15,14 +15,27 @@ message TimestampRequest {}
 
 message TimestampResponse { uint64 ts = 1; }
 
-message GetRequest {}
+message GetRequest {
+  bytes key = 1;
+  uint64 start_ts = 2;
+}
 
-message GetResponse {}
+message GetResponse { bytes value = 1; }
 
-message PrewriteRequest {}
+message PrewriteRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 start_ts = 3;
+  bytes primary_key = 4;
+}
 
-message PrewriteResponse {}
+message PrewriteResponse { bool ok = 1; }
 
-message CommitRequest { bool is_primary = 1; }
+message CommitRequest {
+  bool is_primary = 1;
+  bytes key = 2;
+  uint64 start_ts = 3;
+  uint64 commit_ts = 4;
+}
 
-message CommitResponse {}
+message CommitResponse { bool ok = 1; }

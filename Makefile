@@ -8,7 +8,7 @@ check:
 	cargo fmt --all -- --check
 	cargo clippy --all --tests -- -D clippy::all -A clippy::derive_partial_eq_without_eq
 
-test: test_others test_2 test_3
+test: test_2 test_3 test_percolator
 
 test_2: test_2a test_2b test_2c test_2d
 
